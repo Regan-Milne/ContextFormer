@@ -318,15 +318,21 @@ on RTX 4090-class hardware and reported regardless of outcome:
 - **models:** Qwen3-4B-class dense model plus a substantially different
   family, frozen, no retuning;
 - **contexts:** 8k, 16k, 32k+; multiple data domains; held-out documents;
-- **recall battery** (informed by the multi-instruction and
-  prompt-retention failure modes documented in "The Pitfalls of KV Cache
-  Compression", ACL 2026): many more than 8 needles at systematic depths
-  and multiple seeds; repeated/confusable exact values; code identifiers;
-  UUID-like strings; names; arithmetic-relevant numbers; multiple
-  simultaneous instructions; system-prompt retention; **free-running
-  generation**, not only teacher forcing; RULER or an equivalent
-  standardized long-context evaluation where practical. Evaluation
-  documents will not be used for any tuning before reporting;
+- **recall battery** (protocols adapted from "The Pitfalls of KV Cache
+  Compression", arXiv:2510.00231, ACL 2026): many more than 8 needles at
+  systematic depths and multiple seeds; repeated/confusable exact values;
+  code identifiers; UUID-like strings; names; arithmetic-relevant numbers;
+  IFEval-style multi-instruction prompts with **per-instruction-class
+  degradation curves over a dense compression-ratio sweep** (their leakage
+  results peak at *mid-range* ratios — endpoint-only evaluation is
+  insufficient); a system-prompt-leakage test (defense + directive scored
+  by ROUGE-L, both instruction orders); per-span reconstruction-error
+  instrumentation as the non-eviction analogue of their keep-rate metric;
+  **free-running generation**, not only teacher forcing; and RULER's harder
+  variants (multi-key NIAH with distractors, multi-value/multi-query NIAH,
+  variable tracking — not only single-needle, which models ace while
+  failing the rest). Evaluation documents will not be used for any tuning
+  before reporting;
 - **baselines at matched bytes** (matched bytes, not matched nominal
   rank): full fp16/bf16 KV; straightforward KV quantization and a strong
   modern quantization baseline (KIVI/TurboQuant-class) where practical;

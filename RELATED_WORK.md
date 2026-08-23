@@ -11,7 +11,7 @@ precisely.
 | **xKV** (2503.18893, ICML'26) | yes (SVD at prefill) | yes (decode tokens uncompressed) | layer groups (W=4), concat + SVD | separate (K:V rank 1:1.5) | yes — r-dim coeffs per group | composable | no | low-rank matmul (selective variant) | ~8× incl. factor storage | RULER 88.5 vs 91.9 baseline @8× | up to 4.23× e2e |
 | **JoLT** (2607.12550, 2026) | yes | yes | layer *groups for budget allocation* only; per-layer Tucker | separate (separate budgets) | r_T-dim token coeffs | 4-bit JL-rotated residual | no | Tucker reconstruction each step (no kernel) | 2–3× near-lossless | RULER NIAH ~100% @2–3× | compression-time only |
 | **CLLA** (2410.15252) | **no — trained from scratch** | yes | latent shared across layer pairs | **joint** (MLA-style latent) | yes, 512-dim | 4-bit trained-in | no | up-projection per read | ~48× vs **MHA** baseline | none reported | none reported |
-| **MLA** (DeepSeek-V2/V3) | **no — architecture** | yes | no (per-layer latent) | **joint** + decoupled RoPE dims | yes (e.g. 512-dim + rope dims) | composable | no | up-projection (absorbable) | ~an order vs MHA | (production models) | production |
+| **MLA** (DeepSeek-V2/V3, 2405.04434) | **no — architecture** | yes | no (per-layer latent) | **joint** (d_c=512) + decoupled RoPE key (64, shared across heads) | yes — 576 elems/layer/token | composable | no | up-projection (absorbed into W_UQ/W_O) | 576 vs 32768 elems/layer/token vs MHA; "GQA with 2.25 groups" | (production models) | 5.76× gen throughput vs 67B MHA |
 | **KIVI** (2402.02750, ICML'24) | yes | yes (+128-token fp16 window) | no | asymmetric: per-channel K / per-token V | no | 2-bit, group 32 | no | dequant fused in matmul | ~2.6× peak mem | NIAH maintained (heatmaps) | 2.35–3.47× |
 | **TurboQuant** (2504.19874) | yes (data-oblivious) | yes | no | same scheme both; outlier-channel bits | codes + 1-bit QJL residual | 2.5–3.5 bit/channel | no | lookup + unrotate (unbiased) | >5× | NIAH 0.997 = baseline @>4× | NOT FOUND in paper |
 | **ShadowKV** (2410.21465) | yes (SVD at prefill) | yes (sparse *access*) | no | strongly asymmetric: low-rank pre-RoPE K / offloaded full V | yes — rank-160 K coeffs | no (bf16) | no | K rebuilt for selected chunks + RoPE | ~6× GPU mem | NIAH ok 16K–1M; RULER-128K ~86.9 | 3.04× throughput |
@@ -45,12 +45,18 @@ merging, deep layers). Our result extends the depth axis from pairs to the
 full stack and adds the K/V-coupling and behavioral-metric findings.
 
 **MLA / CLLA** are the architectural existence proofs that a small joint
-per-token latent can carry K/V state — trained in from scratch. Our question
-is the post-hoc frozen-model version: how much of that latent structure
-already exists in a pretrained model's cache, and how to extract it without
-touching weights. Ratios are not directly comparable (CLLA quotes ~48×
-against an MHA baseline; our 16× is against an already-GQA-compressed
-cache).
+per-token latent can carry K/V state — trained in from scratch (MLA: 512-dim
+joint latent plus a 64-dim decoupled RoPE key shared across all heads,
+because low-rank compression is incompatible with rotated positions — the
+same incompatibility our pre-RoPE storage sidesteps; MLA's from-scratch
+ablations show quality ≥ MHA at 4–14% of the cache). MHA2MLA
+(arXiv:2502.14837, identified but not reviewed in depth here) retrofits MLA
+onto existing checkpoints *with finetuning* — the intermediate point between
+trained architectures and our zero-training setting. Our question is the
+fully post-hoc frozen-model version: how much of that latent structure
+already exists in a pretrained cache, and how to extract it without touching
+weights. Ratios are not directly comparable (CLLA quotes ~48× against an MHA
+baseline; our 16× is against an already-GQA-compressed cache).
 
 **KIVI / TurboQuant** are strong storage baselines orthogonal to structure:
 TurboQuant's NIAH-neutral >4–5× is the quantization bar any structural
@@ -66,8 +72,26 @@ paid only on read).
 
 ## Evaluation practice
 
-"The Pitfalls of KV Cache Compression" (ACL 2026) warns that aggregate
-benchmarks hide failures in realistic multi-instruction behavior (details
-in §8 of PREPRINT.md, whose expanded gate adopts its recommendations). Our
-KL-vs-recall dissociation result (§4a of the preprint) is an independent,
-mechanism-level instance of the same warning.
+"The Pitfalls of KV Cache Compression" (arXiv:2510.00231, ACL 2026) documents
+six pitfalls of evaluating compressed caches on aggregate benchmarks,
+measured on eviction policies (StreamingLLM, H2O, SnapKV, TOVA, K-Norm) over
+IFEval-style multi-instruction prompts: instruction classes degrade at
+different rates ("selective amnesia"); degradation patterns are model- and
+policy-dependent; compression causes **system-prompt leakage without
+adversarial prompting**, peaking non-monotonically at *mid-range* compression
+ratios; instruction order redirects which instruction degrades; eviction is
+biased against specific instruction spans; and even unbiased policies pick
+semantically wrong tokens. Its protocol (per-instruction-class degradation
+curves over dense ratio sweeps, rank-correlation homogeneity diagnostics,
+defense+directive leakage scored by ROUGE-L in both orders) is adopted in §8
+of PREPRINT.md, with per-span reconstruction error as our non-eviction
+analogue of their keep-rate instrumentation. Our KL-vs-recall dissociation
+(§4a) and non-monotone rank-vs-behavior artifact (§4b) are independent,
+mechanism-level instances of the same theme: aggregate fidelity metrics and
+mid-scale compression regimes hide the worst failures.
+
+RULER (arXiv:2404.06654, COLM 2024) is the standardized long-context suite
+for the scale gate: its harder variants (multi-key NIAH with distractor
+needles, multi-value/multi-query NIAH, variable tracking) are the meaningful
+tests — models that ace single-needle retrieval still collapse on those.
+Standard practice starts at ~7B models; our 4B-9B gate is in range.
