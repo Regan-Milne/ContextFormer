@@ -2,9 +2,10 @@
 
 **Author:** Regan Milne (github.com/Regan-Milne)
 **Date:** 2026-08-23 (draft; not yet released)
-**Status:** DRAFT. Two pre-registered gates are pending and will be reported
-regardless of outcome: the corpus-basis test (§6.2) and the scale-transfer
-gate (§8). This document will serve as a timestamped disclosure of the
+**Status:** DRAFT. Of two pre-registered gates, the corpus-basis test (§6.2)
+is complete (failed; reported verbatim — the 16× figure is long-context
+only, pending a learned encoder) and the scale-transfer gate (§8) is
+pending and will be reported regardless of outcome. This document will serve as a timestamped disclosure of the
 mechanism and results upon release.
 **License (this document & the forthcoming code):** Apache-2.0.
 
@@ -197,16 +198,34 @@ storing only the residual after previous tokens' compressed states predict
 the current token's stack — is future work, §8; a weak linear probe at token
 level was inconclusive.)
 
-**6.2 Corpus basis — the accounting question. [PENDING — pre-registered.]**
-A per-document basis is ~9 MB and only amortizes on long documents (72
-B/token at 128k context; worse than the savings at 2k). If a single basis
-fit across a diverse corpus (two novels, scientific prose, political prose,
-source code) preserves recall on held-out documents, the basis ships with
-the model at zero marginal cost and the 16× figure is clean at every context
-length. If it fails, the honest claim requires long-context amortization or
-a learned encoder. Results to be inserted verbatim on completion:
+**6.2 Corpus basis — the accounting question. [COMPLETED — gate failed;
+results verbatim as pre-registered.]** A per-document basis is ~9 MB and
+only amortizes on long documents. If a single basis fit across a diverse
+corpus (two novels, scientific prose, political prose, source code)
+preserved recall on held-out documents, the basis would ship with the model
+at zero marginal cost. It does not:
 
-> [PENDING: corpus-basis needle recall + held-out KL table]
+| method (768 B/token, 16× marginal) | recall (held-out needle doc) | gold-NLL |
+|---|---|---|
+| full KV | 8/8 | 0.123 |
+| corpus basis (5 diverse docs, held-out eval) | **3/8** | 0.378 |
+| per-doc basis (reference) | **8/8** | 0.130 |
+
+Held-out teacher-forced KL (Grimm, never in corpus): corpus basis 0.158 at
+16× vs ~0.01-scale for per-doc bases. A five-document corpus basis behaves
+closer to the single-foreign-document basis of §6.1 than to the per-doc
+basis at identical bytes.
+
+Two consequences. **Scientifically**, this is the strongest evidence yet
+*for* the founding hypothesis: the low-dimensional structure that enables
+16× is substantially constructed per document — context, at document
+granularity, is doing the work, and generic model-level structure is not
+sufficient. **For accounting**, the 16× marginal figure requires the per-doc
+basis to be amortized: net bytes/token including a 9.4 MB fp16 basis are
+1,920 (6.4×) at 8k, 1,056 (11.6×) at 32k, 840 (14.6×) at 128k. The claim
+therefore stands for long contexts — the regime where KV compression matters
+— and short-context deployment awaits a learned encoder that *generates* the
+document adaptation instead of storing it (§8).
 
 ## 7. Honest frontier and accounting
 
