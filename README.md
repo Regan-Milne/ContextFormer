@@ -46,8 +46,8 @@ python reproduce_headline.py
 CPU-only, ~10-20 min, ~1 GB model download on first run. Prints full memory
 accounting (marginal and net including basis), KL/top-k/NLL vs the full-KV
 baseline, per-needle exact recall, and PASS/FAIL against the pre-registered
-criterion (recall >= 7/8, KL <= 0.05, top-1 >= 0.90; reference run: 8/8,
-KL 0.010, top-1 0.938).
+criterion (recall >= 7/8, KL <= 0.05, top-1 >= 0.90; verified reference run:
+8/8, KL 0.0086, top-1 0.949, ~1 min prefill on CPU).
 
 See PREPRINT.md for claims and results, RELATED_WORK.md for the field-by-field
 prior-art comparison, and ASSUMPTIONS.md for the falsification ledger.
