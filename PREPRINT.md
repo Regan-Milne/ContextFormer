@@ -301,6 +301,33 @@ exploited: with a linear codec the expansion can be absorbed into the
 query/output projections (MLA-style), letting attention run directly in the
 768-dim latent without ever materializing the stack.
 
+**Small-scale robustness and transfer (laptop suite, 2026-08-23).** Four
+follow-ups sharpen the frontier above:
+
+- **Randomized-needle robustness:** across 3 repetitions with fresh random
+  entities, values, jittered positions, and three filler domains (technical,
+  fiction, political prose), behavioral 16× recalls **24/24** (full KV:
+  24/24); behavioral 32× (int4 coeffs): 21/24. The original 8/8 was not a
+  lucky draw, and no systematic depth bias appears at 16×.
+- **Family transfer:** on frozen TinyLlama-1.1B (Llama architecture), with
+  ranks scaled to its own stack (16× = rank 1408 of 11,264), behavioral 16×
+  recalls 8/8 where the variance-metric control gets 5/8 and full KV itself
+  gets 7/8 (this weaker model is flaky on one needle); teacher-forced KL
+  0.0034. The behavioral-vs-variance gap is not Qwen-specific. On
+  Qwen2.5-1.5B every method including the variance control passes 8/8 (KL
+  0.0001) — at 2k tokens and rank 1792 the per-document basis nearly
+  interpolates the document, so this scale lacks discriminative power;
+  longer contexts (§8) are the real test there.
+- **Longer context:** at 7,465 tokens with 16 needles spanning full depth,
+  behavioral 16× (marginal) recalls 14/16 (gold-NLL 0.197 vs 0.110 full-KV);
+  32× drops to 9/16. Net ratio at this length including the fp16 basis:
+  ~5.9×. The rank-vs-context-length scaling law is a primary question for
+  the scale gate.
+- **A negative result:** quantizing the *basis* to int8 (which would halve
+  basis storage) destroys recall — 2/24 at 16×. The basis, like the keys it
+  reconstructs, is precision-critical; all net-ratio figures in this
+  document therefore assume an fp16 basis.
+
 Additional measured structure: per-token residuals are thin-tailed (99th
 percentile 0.153 vs median 0.092 at rank 384) — under linear codecs there is
 no expensive-token minority, and uniform per-token budgets are justified;
