@@ -1,0 +1,277 @@
+# Mapped KV: Write-Time Memory Geography for Long-Context Decoding on Frozen LLMs
+
+**Author:** Regan Milne (github.com/Regan-Milne)
+**Date:** 2026-08-19
+**Status:** Preprint / technical report. Code release forthcoming (see §8). This
+document is a timestamped disclosure of the mechanism and results.
+**License (this document & the forthcoming code):** Apache-2.0.
+
+---
+
+## Abstract
+
+Autoregressive LLM decoding on local hardware is increasingly bounded by the
+KV cache: its memory-bandwidth cost per token and its VRAM residency both grow
+with context, capping usable context length and dominating decode energy. We
+present **mapped KV**, a training-free modification to a **frozen** pretrained
+model's attention. A recent dense window plus the attention-sink prefix are
+kept verbatim; as tokens age out of the window their keys/values are **placed
+at write time** into content-addressed regions. At each decode step the query
+is **routed** to a few regions and attention runs only over the selected
+neighborhoods plus the window and sinks. Unlike eviction (H2O, SnapKV) or
+sink+window truncation (StreamingLLM) nothing is discarded; and unlike
+clustered-KV retrieval systems that estimate the unretrieved tail to preserve
+full-attention accuracy - closest among them **RetroInfer** (Lu et al., 2025)
+ -  mapped KV runs **exact** attention over only its selected regions with **no
+tail estimation**, and is demonstrated on a **frozen hybrid** (Gated-DeltaNet
++ attention) model. We meter success in **KV entries touched per token**, the
+quantity that sets local-AI bandwidth and energy.
+
+The mechanism was frozen on a 0.5B model and carried **without
+architecture-specific retuning** through 3B, the Qwen3.5 hybrid
+(Gated-DeltaNet + attention) family at 2B/4B, and a 9B production target.
+Under an adversarial, pre-registered protocol it holds near-full quality
+(ΔPPL +1.4 / +3.8 / +7.5% at 8k / 16k / 32k on Qwen3.5-2B) with intact far
+retrieval, while the per-attention-layer KV touch advantage **grows** with
+context (6.1× → 15.7×); random-routing and window-only controls collapse
+(ΔPPL up to +331%, 0/6 passkey). Built into a real incremental-decode runtime,
+mapped KV cuts physical KV traffic 16–31× at 32k and reduces decode energy up
+to ~2× net J/token versus stock attention, growing with context. A
+region-granular **RAM↔VRAM tier** then lets cold KV leave VRAM: on a 24 GB
+card a 9B runs 32k and 64k contexts that do **not** fit resident - logical
+context exceeds physical KV residency by ≥2×, retrieval intact.
+
+We also report, honestly, where the mechanism does **not** win: against a
+heavily-optimized full-attention baseline (llama.cpp with flash attention and
+KV-quantization) at mainstream context lengths, we are slower, and that
+baseline already fits a 27B at 128k on 24 GB. The differentiated, robust value
+of mapped KV is **capacity beyond VRAM** (context tiered to host RAM, past what
+VRAM can hold even with KV-quant) and **flat decode/energy cost at extreme
+depth** - the long-memory-agent regime.
+
+---
+
+## 1. Introduction
+
+On local hardware, the KV cache - not the weights - is the scaling wall for
+long context. Weights are a fixed cost that quantizes well; the KV cache grows
+linearly with context in both the bandwidth read per generated token and the
+VRAM it occupies. As weights are quantized to fit larger models on consumer
+GPUs, the KV cache's *share* of decode cost rises.
+
+Our thesis: **a frozen pretrained model already contains a navigable memory
+geography** - its keys are organized enough that a query can be routed to a
+small set of relevant regions instead of attending over the entire history -
+and this can be exploited at inference time with **no fine-tuning**.
+
+**Contributions.**
+1. A training-free mechanism that organizes a frozen model's KV cache into
+   content-addressed regions **at write time** and routes each decode step to a
+   few regions.
+2. A **touch/traffic-first** evaluation methodology (KV entries touched per
+   token), appropriate to local-AI economics.
+3. An **adversarial, pre-registered validation ladder** with controls.
+4. **Transfer** across scale (0.5B→3B→9B) and architecture family (dense →
+   Qwen3.5 hybrid) with zero architecture-specific retuning.
+5. A runtime with **RAM↔VRAM tiering** that provides context beyond VRAM, with
+   measured energy, traffic, and capacity.
+
+## 2. Related work and differentiators
+
+KV-compression methods fall into: **eviction** (H2O, SnapKV - discard
+low-value entries), **sink+window** (StreamingLLM - keep the prefix and a
+recent window, forget the middle), and **retrieval over a clustered/ANN KV
+store** (InfLLM, RetrievalAttention, ClusterKV, and - closest to this work -
+**RetroInfer**).
+
+**Nearest neighbor: RetroInfer** (Lu et al., 2025; arXiv:2505.02922). Like
+mapped KV, it treats the KV cache as a clustered vector store: it clusters
+keys, keeps centroids as a small index, scores the query against those
+centroids, retrieves only the selected clusters, and tiers cold KV to host RAM
+with incremental index updates. On dense-attention models it scales this to
+120K–1M-token contexts with custom GPU/CPU kernels and large throughput gains
+(up to 4.4× over full attention at 120K, 12.2× over sparse baselines at 1M) at
+full-attention-level accuracy. We do **not** claim the cluster–route–tier
+skeleton as novel: RetroInfer establishes it and scales it beyond what we
+demonstrate. And because RetroInfer's index is itself updated incrementally
+during decoding, the "write-time vs. post-hoc index" distinction does not
+separate the two systems, and we do not rest on it.
+
+Mapped KV differs from RetroInfer on three axes we can state precisely:
+
+1. **No attention estimation.** RetroInfer's central device is an
+   accuracy-bounded *estimation zone*: unretrieved clusters still contribute
+   an approximated attention mass computed from their centroids, which is how
+   it preserves full-attention accuracy. Mapped KV runs **exact** softmax over
+   only {sinks ∪ window ∪ top-*r* selected regions}; unselected regions
+   contribute nothing. This is strictly simpler and more aggressive, and it
+   costs some perplexity (ΔPPL +1.4 / +3.8 / +7.5% at 8k / 16k / 32k on
+   Qwen3.5-2B) - yet discrete far-retrieval survives (passkey held). The
+   finding of interest is therefore that, **for retrieval, the estimation
+   machinery may be unnecessary**: hard top-*r* selection suffices when a
+   small perplexity cost is acceptable.
+2. **Frozen hybrid target.** RetroInfer is demonstrated on dense-attention
+   transformers (Llama-3, Qwen2.5, DeepSeek-R1-Distill). Mapped KV is grafted
+   onto a **frozen Qwen3.5 hybrid** (Gated-DeltaNet + attention) with zero
+   architecture-specific retuning, routing only the small subset of
+   conventional-attention layers - which appear to carry a disproportionate
+   long-range, content-addressable role.
+3. **Touch-first, pre-registered, adversarial evaluation.** We meter **KV
+   entries touched per token** (the quantity that sets local-AI bandwidth and
+   energy) rather than headline throughput, and every phase is pre-registered
+   with window-only and random-routing controls that must collapse (they do:
+   0/6 passkey, ΔPPL up to +331%).
+
+Relative to eviction (H2O, SnapKV) and sink+window (StreamingLLM), mapped KV
+also **evicts nothing** - all context is retained and tiered, not discarded.
+
+## 3. The mapped-KV mechanism
+
+**Store layout.** Per conventional-attention layer, the KV store is: the
+attention-**sink** prefix (first N_SINK positions) + a recent dense **window**
+(WINDOW positions), both kept verbatim; plus **aged regions** - older KV
+grouped by content.
+
+**Write-time placement.** As a token ages out of the dense window, its key/value
+is assigned to a region via running, k-means-style centroids maintained per
+layer and per KV-head group. Organization happens once, at write time.
+
+**Per-token routing.** At each decode step, the query scores the centroids,
+selects the top-*r* regions, and attention runs only over {window ∪ sinks ∪
+selected regions}. Breadth *r* is a user-visible knob (r8 favors discrete
+needle retrieval; r16 favors perplexity).
+
+**Two frozen variants.** *Fixed-centroid* (centroids frozen after warm-up) and
+*B1* (periodic wholesale re-clustering of accumulated content, budgeted like
+garbage collection). Both travel unchanged across models; neither is crowned.
+
+**RAM↔VRAM tiering.** The hot set (window + sinks + centroids + a small LRU of
+recently-selected regions) lives in VRAM; cold aged regions live in **pinned
+host RAM** and are gathered over PCIe on selection. Selection semantics are
+unchanged - routing decides *which* regions; tiering only changes *where* their
+bytes live.
+
+## 4. Validation methodology
+
+Every phase was **pre-registered** before its build, with interpretations fixed
+in advance and success rates reported only at pre-registered seed counts.
+Probes are **adversarial**: fresh long documents, out-of-distribution domains,
+and needle/passkey retrieval that a window-only baseline provably fails.
+**Controls**: window-only (the forgetting baseline) and random-region routing
+(routing must beat luck). Every implementation optimization was gated for
+**bit-honest equivalence** - identical touched-sets and NLL within the original
+tolerance - re-run after each change; two real bugs were caught this way.
+
+## 5. Results - teacher-forced ladder
+
+**5.1 Geography exists in a frozen model.** Probes on a frozen 0.5B model show
+its co-relevant keys are navigable: a query concentrates on a small set of
+regions well above chance.
+
+**5.2 Training-free graft; the advantage grows with context.** The training-free
+graft holds near-full quality while touching a small fraction of the cache, and
+the **touch advantage grows with context length** - the make-or-break scaling
+signal. A learned-router variant was tested and **rejected** at the transfer
+gate; training-free routing wins.
+
+**5.3 Transfer across scale and family, zero retuning.** The mechanism, frozen
+on 0.5B, was carried unchanged to 3B and then to the **Qwen3.5 hybrid**
+(Gated-DeltaNet + attention) at 2B, and reproduced at 4B. Headline transfer
+result (Qwen3.5-2B, B1-r16):
+
+| ctx | ΔPPL | touch% | per-attn-layer advantage | passkey (full / b1-r16) |
+|----:|-----:|-------:|-------------------------:|:-----------------------:|
+| 8k  | +1.4% | 16.5 | 6.1× | 6/6 / 6/6 |
+| 16k | +3.8% | 9.5  | 10.5× | 6/6 / 5/6 |
+| 32k | +7.5% | 6.4  | 15.7× | 6/6 / 5/6 |
+
+Controls collapse: random-routing +88.6%→+237% ΔPPL and window-only
++160%→+331% across 8k→32k, both 0/6 passkey at every length. The six
+KV-attention layers of the hybrid appear to carry a disproportionately
+important long-range, content-addressable role.
+
+## 6. Results - the runtime (generation-mode, metered)
+
+**R0 - decode core.** An incremental-decode engine on the frozen Qwen3.5-2B
+passes decode-equivalence and mapped-equivalence gates and scores **54/54** on
+generation-mode passkey across contexts and configs.
+
+**R9 - production target.** The frozen mechanism instantiates and behaves
+correctly on Qwen3.5-**9B**, unchanged (perfect passkey at 8k/16k), confirming
+transfer to the deployment target.
+
+**R1 - energy and traffic (2B, at the wall).** Paired runs, CUDA-synchronized,
+nvidia-smi power. Stock full attention's power grows with cache size while
+mapped stays near-flat; net energy advantage **1.48× @8k → 1.60× @16k → 1.83×
+@32k** (b1-r16; 2.06× b1-r8). Physical KV traffic at 32k: b1-r16 reads 2,022 of
+32,768 positions (**16.2× less**; b1-r8 **31×**). The like-for-like whole-model
+gain (b1-r16 vs the same engine's full attention at 32k) is **1.10×**, matching
+an a-priori Amdahl bound of ~1.09× - the accounting validated end to end.
+
+**R2 - capacity beyond VRAM.** With cold KV tiered to pinned host RAM, the 9B
+runs **32k and 64k** contexts that do **not** fit resident bf16 on a 24 GB card
+(3/3 passkey at both), peaks 20.1 / 21.4 GB, KV tiered out 1.05 / 2.09 GB.
+**Logical context exceeds physical KV residency by ≥2×**, retrieval intact.
+
+**R2.1 - latency paydown.** Batched/de-serialized cold-fetch path: cold-storm
+p90 207 → 134 ms; 32k decode ~112–127 ms/tok (from ~156–190). The hot cache
+becomes a *traffic* knob rather than a latency knob - ~87 MB captures nearly all
+the latency.
+
+## 7. Honest positioning and limits
+
+We measured the mechanism against a heavily-optimized full-attention baseline
+and against its own implementation, and report both plainly.
+
+**7.1 Batch-1 decode is dominated by non-matmul overhead.** Profiling the
+mapped decode at batch 1 shows the quantizable weight-matmul is a *minority* of
+per-token time; a large eager-mode / kernel-launch overhead ("the waiter")
+dominates, with the GPU idle much of each step. The primary latency lever is
+therefore CUDA graphs, not the attention mechanism.
+
+**7.2 Optimized full attention is fast and holds to 128k.** Baseline:
+Qwen3.8-27B (Unsloth UD-Q5_K_S GGUF) in llama.cpp on a 24 GB RTX 4090, flash
+attention + q8_0 KV-quant:
+
+| context depth | decode tok/s |
+|---:|---:|
+| 0    | 39.9 |
+| 8k   | 39.7 |
+| 32k  | 37.7 |
+| 65k  | 34.0 |
+| 128k | 28.7 |
+
+128k fits 24 GB comfortably; with heavier KV-quant the ceiling reaches
+~200–400k. The full-attention "sag" with depth is real and accelerating
+(15% → 28% by 128k) but bites from a fast baseline.
+
+**7.3 Where mapped KV wins, honestly.** It does **not** beat optimized full
+attention on speed at mainstream context, and quality parity ("on par") is the
+target, not a claimed advantage. The differentiated, robust value is:
+- **Capacity beyond VRAM (unconditional):** cold KV lives in host RAM, so
+  usable context is RAM-bounded, not VRAM-bounded - an order of magnitude past
+  what an optimized full-attention stack can hold on the same card even with
+  KV-quant. We run what they cannot.
+- **Flat decode/energy at extreme depth (conditional):** routing keeps
+  per-token KV cost ~flat while full attention's KV read eventually rivals the
+  weight read; realized in wall-clock once the eager floor is removed.
+
+The natural regime for this is **long-memory agents** - continuous sessions
+that accumulate very large, growing context.
+
+**7.4 Limits.** PyTorch/NVIDIA runtime (a llama.cpp port is future work); the
+eager-mode floor above; the extreme-context niche; and quantization is a
+capacity means, not a speed win at batch 1.
+
+## 8. Availability
+
+A curated code release is forthcoming. This report exists to timestamp the
+mechanism and results prior to that release.
+
+## Appendix A - reproduction notes
+
+Hardware: RTX 4090 (24 GB). Stack: transformers 5.15.0, torch 2.11.0+cu128.
+Models: Qwen2.5-0.5B/3B (early ladder), Qwen3.5-2B/4B/9B (frozen; hybrid
+Gated-DeltaNet + attention). Power via nvidia-smi integration; idle baseline
+recorded per run. Full pre-registration texts, gate definitions, and complete
+per-context/per-config/per-seed tables accompany the code release.

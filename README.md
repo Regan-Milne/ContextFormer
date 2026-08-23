@@ -34,6 +34,24 @@ is a mandatory baseline.
   distillation losses, the context-ablation at fixed latent size, adaptive
   per-token budgets, evolutionary search over allocation policies.
 
+## Reproduce the headline result
+
+```
+git clone https://github.com/Regan-Milne/ContextFormer
+cd ContextFormer
+pip install -r requirements.txt
+python reproduce_headline.py
+```
+
+CPU-only, ~10-20 min, ~1 GB model download on first run. Prints full memory
+accounting (marginal and net including basis), KL/top-k/NLL vs the full-KV
+baseline, per-needle exact recall, and PASS/FAIL against the pre-registered
+criterion (recall >= 7/8, KL <= 0.05, top-1 >= 0.90; reference run: 8/8,
+KL 0.010, top-1 0.938).
+
+See PREPRINT.md for claims and results, RELATED_WORK.md for the field-by-field
+prior-art comparison, and ASSUMPTIONS.md for the falsification ledger.
+
 ## Layout
 
 - `scripts/capture.py` -- Phase 0: load frozen model, print/write KV

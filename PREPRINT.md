@@ -18,21 +18,28 @@ mechanism and results upon release.
 
 Every token an LLM reads leaves behind a layer-by-layer stack of key/value
 vectors — the KV cache — whose size, not the token's, dominates long-context
-memory. Prior compression work carves this cache along its storage layout:
-per layer, and within a layer per K or per V, then quantizes or factorizes
-each piece. We present evidence that **this carving is wrong in every
-direction it cuts**, and that the natural unit of compression is the
-**whole per-token stack**: all layers, K and V together, treated as one
-object.
+memory. Most post-hoc compression operates on per-layer, per-K/V pieces of
+this cache; a growing line of work (MiniCache's adjacent-layer merging,
+xKV's cross-layer SVD over layer groups, and architecture-level latent
+caches such as DeepSeek's MLA and cross-layer latent attention) shows that
+substantial redundancy runs in the depth dimension. Our results are
+consistent with that literature and sharpen it with matched-bytes,
+behavior-scored evidence for a specific unit: the **complete per-token
+stack** — all layers, K and V together, as one coupled object — on a frozen
+model, with every token retained and exact-detail recall as a mandatory
+metric.
 
 On a frozen Qwen2.5-0.5B (no training, no finetuning) with a plain linear
 codec (PCA), three matched-bytes results:
 
-1. **Cross-layer carving.** Compressing each token's whole 24-layer stack as
-   one object beats per-layer compression by ~**100× in next-token KL at
-   identical bytes/token** (0.033 vs 3.66 at 768 B/token). The dominant
-   redundancy in KV runs *between* layers — invisible, by construction, to
-   any per-layer method.
+1. **The whole-token object.** Compressing each token's complete 24-layer
+   stack as one object beats independent per-layer compression by ~**100×
+   in next-token KL at identical bytes/token** (0.033 vs 3.66 at 768
+   B/token) in this model. Per-layer factorization cannot represent
+   cross-layer structure by construction; our matched-bytes comparison
+   quantifies how much behavioral fidelity that costs here, and extends the
+   cross-layer observation from adjacent pairs and layer groups to the full
+   stack of a single token.
 2. **Behavioral metric.** Variance (PCA energy) is the wrong objective:
    rank-vs-quality is *non-monotone* under it (rank 192 is far worse than
    rank 96), an artifact that vanishes under a simple behavior-weighted
@@ -45,8 +52,9 @@ codec (PCA), three matched-bytes results:
    cutting it along layers.
 
 With the whole-token object and the behavioral metric, the frozen model runs
-at **16× fewer KV bytes/token (768 B vs 12,288 B fp16) with exact-detail
-recall fully intact**: 8/8 planted 5-digit facts recovered by greedy decoding
+at **16× fewer KV bytes/token (768 B vs 12,288 B fp16; marginal rate — net
+accounting including the per-document basis is given in §6.2/§7) with
+exact-detail recall fully intact**: 8/8 planted 5-digit facts recovered by greedy decoding
 (gold-digit NLL 0.130 vs 0.123 full-KV; mean next-token KL 0.010; top-1
 agreement 0.938). At 32×, recall is 7/8. We further show that mean-KL-style
 metrics alone are untrustworthy for this problem: codecs exist that score
@@ -70,6 +78,33 @@ little per-token state must actually remain resident? Conventionally a token
 already provides. The target is `t_i + C_i -> Z_i`: token identity retained,
 context retained, and a radically smaller per-token state `Z_i` from which
 the stack's *function* is recovered.
+
+**What is and is not claimed as novel.** Cross-layer/depth redundancy in KV
+caches is established prior art (MiniCache's adjacent-layer merging, NeurIPS
+2024; xKV's cross-layer SVD over layer groups with per-token coefficients,
+arXiv:2503.18893; tensor-factorization approaches such as JoLT; and trained
+architectures — DeepSeek's MLA, cross-layer latent attention — that build a
+per-token latent in from scratch). See RELATED_WORK.md for a field-by-field
+comparison. Against that background, the specific claims of this report are:
+
+1. **Whole-token object across all tested layers** — one coupled object per
+   token spanning the entire depth, rather than adjacent-pair merging or
+   fixed layer groups — with matched-bytes behavioral evidence for the gap.
+2. **Joint K+V representation**, with matched-bytes evidence that separating
+   K and V (as prior factorization methods do) destroys exact recall in our
+   setup (§5).
+3. **Behavior-weighted component selection**, where importance derives from
+   how perturbations affect attention and output rather than from variance —
+   including the observation that variance ordering is behavior-*misordered*
+   (non-monotone) in this model (§4).
+4. **Exact-detail recall as a mandatory metric**, with a demonstration that
+   low KL can coexist with catastrophic retrieval failure (§4a).
+5. **Document-adaptive structure**, quantified same-document vs foreign vs
+   corpus-basis at matched bytes (§6).
+6. Context-conditioned per-token latent state (`t_i + C_i → Z_i`) is the
+   founding *hypothesis*, and is **not claimed as established**; §6.1
+   specifies the conditional rate-distortion experiment that would establish
+   it.
 
 Two framing commitments distinguish this from adjacent work:
 
@@ -107,7 +142,10 @@ Two structural facts established first:
   smaller — never raw KV, which is a redundant materialization of it.
 - **Keys are stored pre-RoPE** and re-rotated at read time; position indices
   are free because every token is retained. This preserves the low-rank
-  structure that position rotation otherwise destroys.
+  structure that position rotation otherwise destroys. (Pre-RoPE key
+  factorization with prefill-time SVD has direct precedent in ShadowKV,
+  arXiv:2410.21465, whose key side is low-rank per-token coefficients; see
+  RELATED_WORK.md.)
 
 ## 3. Finding 1: the object, not the algorithm
 
@@ -122,11 +160,14 @@ matched to bytes) and identical data, only the object boundary changed:
 Spectra agree: 95% of the joint stack's energy lies in 623 of 6,144
 dimensions — 5.2× fewer coefficients than the per-layer treatments need for
 the same energy, because adjacent layers' contributions are highly
-correlated (mean adjacent-layer hidden cosine 0.86–0.94 after layer 2). The
-transformer re-derives nearly the same representation layer after layer;
-per-layer compression discards exactly that structure. The convention it
-replaces was never a finding — it is the cache's memory layout promoted,
-unexamined, into a method.
+correlated (mean adjacent-layer hidden cosine 0.86–0.94 after layer 2).
+Depth redundancy itself is consistent with prior observations (MiniCache;
+xKV; see RELATED_WORK.md). What this experiment adds is the matched-bytes,
+behavior-scored comparison at the granularity of one token's *complete*
+stack: in this model, the common per-layer storage boundary is not aligned
+with the cache's most behavior-preserving compressible structure, and the
+cost of that misalignment is large. Whether the same gap holds at scale is
+the pre-registered gate of §8.
 
 ## 4. Finding 2: behavior, not energy — and recall, not KL
 
@@ -192,14 +233,22 @@ seam — and you pay heavily at matched bytes. The whole stack is the object.
 The founding hypothesis holds that *context* is what renders per-token state
 compressible. Current evidence, honestly split:
 
-**6.1 Document-level context: yes.** A basis fit on the evaluation document
-compresses it to KL 0.011 at 16×; the same-rank basis fit on a *different*
-document (technical preprint applied to Moby-Dick): KL 0.269 — **24× worse
-at identical bytes**. The exploited structure is substantially specific to
-the document. (Token-level context conditioning — a causal predictive coder
-storing only the residual after previous tokens' compressed states predict
-the current token's stack — is future work, §8; a weak linear probe at token
-level was inconclusive.)
+**6.1 Sequence-specific structure: yes. Semantic causation: not yet
+established.** A basis fit on the evaluation document compresses it to KL
+0.011 at 16×; the same-rank basis fit on a *different* document (technical
+preprint applied to Moby-Dick): KL 0.269 — **24× worse at identical bytes**.
+The exploited structure is therefore substantially **document-specific**. We
+deliberately describe this as sequence/document-specific compressible
+structure rather than proof that *semantic context* causes the effect —
+domain, register, or token-distribution shift could each contribute, and a
+weak token-level linear probe was inconclusive. The founding hypothesis
+`t_i + C_i → Z_i` becomes established only by a controlled **conditional
+rate-distortion comparison**: at identical latent budget and comparable
+decoder capacity, compare `Z_i → X̂_i` against `(t_i, C_i, Z_i) → X̂_i`
+(a causal predictive coder conditioning on previous tokens' *compressed*
+states), and plot bytes/token vs behavioral fidelity for both. If context
+conditioning moves that frontier strongly left, the hypothesis holds; this
+is pre-registered as part of §8.
 
 **6.2 Corpus basis — the accounting question. [COMPLETED — gate failed;
 results verbatim as pre-registered.]** A per-document basis is ~9 MB and
@@ -219,11 +268,11 @@ Held-out teacher-forced KL (Grimm, never in corpus): corpus basis 0.158 at
 closer to the single-foreign-document basis of §6.1 than to the per-doc
 basis at identical bytes.
 
-Two consequences. **Scientifically**, this is the strongest evidence yet
-*for* the founding hypothesis: the low-dimensional structure that enables
-16× is substantially constructed per document — context, at document
-granularity, is doing the work, and generic model-level structure is not
-sufficient. **For accounting**, the 16× marginal figure requires the per-doc
+Two consequences. **Scientifically**, this strengthens the evidence that
+the low-dimensional structure enabling 16× is substantially constructed per
+sequence — generic model-level structure is not sufficient. It is
+*consistent with* the founding context hypothesis but does not establish
+semantic causation (§6.1). **For accounting**, the 16× marginal figure requires the per-doc
 basis to be amortized: net bytes/token including a 9.4 MB fp16 basis are
 1,920 (6.4×) at 8k, 1,056 (11.6×) at 32k, 840 (14.6×) at 128k. The claim
 therefore stands for long contexts — the regime where KV compression matters
@@ -266,13 +315,36 @@ Everything above is one 0.5B model, 2k-token contexts, 8 needles, one seed,
 linear codecs, CPU. The claims are staked on the following gate, to be run
 on RTX 4090-class hardware and reported regardless of outcome:
 
-- models: Qwen3-4B (dense) and a hybrid-family model, frozen, no retuning;
-- contexts: 8k–32k, held-out documents, needles at systematic depths;
-- protocol: identical harness (compressed past, teacher-forced window,
-  greedy needle retrieval), behavioral-metric whole-stack codec at 8×/16×/32×,
-  with quantization and per-layer low-rank as controls;
-- success: recall intact at ≥16× with ΔNLL within noise of the 0.5B result;
-- failure modes to be characterized, not hidden.
+- **models:** Qwen3-4B-class dense model plus a substantially different
+  family, frozen, no retuning;
+- **contexts:** 8k, 16k, 32k+; multiple data domains; held-out documents;
+- **recall battery** (informed by the multi-instruction and
+  prompt-retention failure modes documented in "The Pitfalls of KV Cache
+  Compression", ACL 2026): many more than 8 needles at systematic depths
+  and multiple seeds; repeated/confusable exact values; code identifiers;
+  UUID-like strings; names; arithmetic-relevant numbers; multiple
+  simultaneous instructions; system-prompt retention; **free-running
+  generation**, not only teacher forcing; RULER or an equivalent
+  standardized long-context evaluation where practical. Evaluation
+  documents will not be used for any tuning before reporting;
+- **baselines at matched bytes** (matched bytes, not matched nominal
+  rank): full fp16/bf16 KV; straightforward KV quantization and a strong
+  modern quantization baseline (KIVI/TurboQuant-class) where practical;
+  per-layer low-rank; a faithful cross-layer-merging analogue
+  (MiniCache-style) and xKV-style layer-group SVD at matched effective
+  storage; and full recomputation from text as the zero-cache compute
+  baseline. Reconstruction FLOPs and wall-clock reported separately from
+  representation size;
+- **context test:** the conditional rate-distortion comparison of §6.1
+  (context-conditioned vs unconditioned codec at identical latent budget) —
+  the founding hypothesis is claimed only if this moves the frontier;
+- **pre-registered failure criteria:** the mechanism fails the gate if
+  recall (across the battery, not only simple needles) degrades materially
+  at ≥16× marginal where the 0.5B result held, or if matched-byte baselines
+  reach equivalent fidelity — in which case the contribution reduces to the
+  evaluation methodology and the matched-bytes comparisons, and will be
+  reported as such. Anomalous runs are retained; observation is
+  distinguished from explanation.
 
 > [PENDING: scale-gate results table]
 
