@@ -119,9 +119,13 @@ def stack_unflat(X, L, kvh, hd):
     return g(X[:, :half]), g(X[:, half:])
 
 
-def fit_joint(k_pre, v_pre, fit_len, R):
+def fit_joint(k_pre, v_pre, fit_len, R, scale=None):
+    """scale: optional (1, D) tensor replacing the variance normalizer -- PCA
+    then minimizes error under the metric ||x/scale|| instead of whitened L2.
+    Pass scale = 1/behavioral_sensitivity for behavior-weighted compression."""
     X = stack_flat(k_pre, v_pre)
-    std = X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
+    std = scale if scale is not None else \
+        X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
     mu, W = pca_fit(X[:fit_len] / std, R)
     return {"std": std, "mu": mu, "W": W}
 

@@ -18,15 +18,16 @@ Status codes: **UNTESTED** / **WOBBLED** (evidence against, not decisive) /
 | A5 | per-document basis generalizes / is legitimate | our phase-1 shortcut | **TESTED, split verdict** | foreign basis degrades KL 24x (joint) / 2.4x (traj) => structure is substantially doc-specific. BUT basis storage (9MB for joint-768) only amortizes at long contexts: 4.6KB/tok at 2k, 72B/tok at 128k. Per-doc bases pay off only for long docs; short docs need a *generated* adaptation (Phase 2 encoder) | corpus-fit global basis (many docs) vs per-doc, to separate "domain" from "document" | laptop-hours |
 | A6 | every token deserves the same budget (uniform Z size) | our phase-1 simplification | **SUPPORTED (surprising)** | residual tail is THIN: median 0.092, p99 0.153, max 0.179 -- no expensive-token minority at the linear-codec level. Weak correlates (surprisal +0.26, log-freq -0.27). Adaptive two-tier LOST badly (KL 6.2 vs 0.53 uniform at matched bytes) -- confounded by A15 anomaly, but the thin tail independently says there's little to reallocate | retry adaptive with anomaly-free tiers after A15 is understood; re-test under learned codecs (tail may be codec-induced) | laptop-hours |
 | A7 | mean KL captures the damage that matters | eval convention | **FALSIFIED** | at 16x, mean KL 0.033 "looks intact" but needle recall is 4/8; trajectory codecs recall 0/8 at KL ~0.6. Mean KL and exact recall dissociate completely. Every Pareto point now requires a recall column | done; recall harness now standing (a7_needle.py) | done |
-| A8 | variance (PCA energy) is the right objective for subspace choice | tool default | **WOBBLED** | per-layer K rank-64 keeps 95%+ energy yet ruins behavior; energy != behavior | behavior-weighted PCA: weight directions by observed query subspace / attention gradients, compare at matched rank | laptop-days |
+| A8 | variance (PCA energy) is the right objective for subspace choice | tool default | **FALSIFIED; behavioral metric CONFIRMED better** | diagonal query/o_proj-weighted metric: KL 0.010 vs 0.033 at rank 768, 0.11 vs 0.53 at rank 384, AND needle recall 8/8 at 16x (variance metric: 4/8), 7/8 at 32x (variance: 2/8). The laptop gate passed | non-diagonal metric (full E[qq']), learned metric on 4090 | done (diag) |
 | A9 | all layers matter equally (uniform rank across layers) | our phase-1 simplification | **UNTESTED** | layer-0 K is rank ~7; late-layer V ranks collapse (spectra) | leave-one-layer-out and per-layer rank allocation sweep | laptop-hours |
 | A10 | recent tokens need full precision (exactness window) | field intuition | **UNTESTED** | none; phase 1 window tokens were uncompressed by construction (confound noted) | shrink/remove the exact window, measure | laptop-hours |
 | A11 | compressed state must be expanded back to full KV before attention | our harness convention | **UNTESTED** | none; with a linear codec, attention can run *in latent space* (absorb basis into q/o projections, MLA-style), changing the compute Pareto entirely | derive absorbed form for the PCA codec, verify logits match expansion path | laptop-days |
 | A12 | small-model findings transfer to larger models | necessity (hardware) | **UNTESTED** | none | rerun phases 0-1 on 4B-9B class on the 4090 | 4090-hours |
 | A13 | fp16-GQA cache is the honest denominator for ratios | our accounting choice | adopted | GQA already bakes in 7x vs MHA; we quote on top of it | n/a (accounting policy, revisit if models change) | -- |
 | A14 | pre-RoPE storage with rotation re-applied at read | our design choice | **SUPPORTED** | exact round-trip verified (phase 0); position free since tokens retained | none needed at this scope | done |
-| A15 | joint-stack rank-192 anomaly is a bug/outlier interaction, not a real cliff | our guess | **UNTESTED, now load-bearing** | rank-192 KL 6.5 >> rank-96 KL 4.3 (non-monotone); reappeared in A6 (adaptive tiers using rank-192 collapse to KL 6.2). Behavior is non-monotone in energy-ordered rank: adding components 97-192 HURTS. Half-reconstructed key directions may misdirect attention worse than absent ones. Directly implicates A8 | isolate offending components; check K outlier channels x standardization; test behavior-ordered component selection | laptop-hours |
-| A16 | behavior degrades monotonically as rank drops (more components = better) | implicit in all rank sweeps | **FALSIFIED** | A15 evidence x2: rank 192 much worse than rank 96 at matched everything else | fold into A8/A15 resolution | done |
+| A15 | joint-stack rank-192 anomaly is a bug/outlier interaction, not a real cliff | our guess | **RESOLVED** | the cliff was a variance-metric artifact: under the behavioral metric the sweep is strictly monotone (7.40 / 2.55 / 0.11 / 0.010 for ranks 96/192/384/768). Variance ordering half-reconstructs behaviorally-critical directions and misdirects attention | done | done |
+| A16 | behavior degrades monotonically as rank drops (more components = better) | implicit in all rank sweeps | **FALSIFIED (variance ordering only)** | monotonicity restored under behavioral ordering; non-monotonicity was diagnostic of the wrong metric, not of the model | done | done |
+| A18 | K-stack and V-stack can be compressed with separate bases (K deserves a private budget) | our A8 side-experiment | **FALSIFIED** | split codecs (K512/V256, K576/V192, behavioral metric, 16x) recall 0/8 with gold-NLL ~2.8 -- catastrophically worse than the joint codec at identical bytes. K and V of a token are strongly coupled; cutting the stack along the K/V seam is as destructive as cutting it along layers. The per-token whole-stack really is the natural object | understand the K-V coupling (shared components' K/V loadings) | laptop-hours |
 | A17 | needle recall is depth-uniform | implicit | **WOBBLED** | at 16x, recalled needles cluster shallow (`YYY.Y...`) even though deeper needles sit closer to the query | vary depth systematically, more needles, multiple seeds | laptop-hours |
 
 ## Priority queue (updated 2026-08-23 after A5/A6/A7 results)
@@ -50,7 +51,13 @@ Status codes: **UNTESTED** / **WOBBLED** (evidence against, not decisive) /
 
 No compression result is quotable from mean KL alone. Every Pareto point
 carries: mean KL, top-1 agreement, **needle recall**, and gold-digit NLL.
-The current honest frontier under that rule: **quant K8V4 at 2.6x is the
-largest ratio with intact recall (8/8)**. Joint-768 c8 (16x) holds 4/8.
-All trajectory-space points: 0/8 -- their mean-KL advantage was purchased by
-destroying addressable detail exactly as the K-addressability theory predicted.
+
+**Honest frontier as of 2026-08-23 (behavioral metric, laptop gate passed):**
+- 16x: behavioral joint-768 c8 -- recall 8/8, gold-NLL 0.130 (full KV: 0.123),
+  KL 0.010, top-1 0.938. Effectively intact.
+- 32x: behavioral joint-768 c4 or joint-384 c8 -- recall 7/8 (deepest needle
+  lost), gold-NLL ~0.27.
+- Superseded: variance-metric points (16x held only 4/8); trajectory-space
+  points (0/8); split K/V bases (0/8).
+
+Next gate: 4090 -- replicate at 4B-9B scale, 32k context, held-out documents.
