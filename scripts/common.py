@@ -79,6 +79,85 @@ def eval_window(model, ids, keys, values, past_len):
     return out.logits.squeeze(0).float()   # (T - past_len, vocab)
 
 
+@torch.no_grad()
+def prefill_doc(model, ids):
+    """Full prefill returning hidden trajectory, post-RoPE KV, and logits."""
+    out = model(ids, output_hidden_states=True, use_cache=True)
+    pkv = out.past_key_values
+    legacy = pkv.to_legacy_cache() if hasattr(pkv, "to_legacy_cache") else pkv
+    keys = torch.stack([kv[0].squeeze(0) for kv in legacy]).float()
+    values = torch.stack([kv[1].squeeze(0) for kv in legacy]).float()
+    hidden = torch.stack([h.squeeze(0) for h in out.hidden_states]).float()
+    return hidden, keys, values, out.logits.squeeze(0).float()
+
+
+# ---------------- analytic codecs (shared by A5/A6/A7 scripts) ----------------
+
+def qsim(x, bits, dim):
+    qmax = 2 ** (bits - 1) - 1
+    scale = x.abs().amax(dim=dim, keepdim=True).clamp_min(1e-8) / qmax
+    return (x / scale).round().clamp(-qmax, qmax) * scale
+
+
+def pca_fit(X, r):
+    mu = X.mean(0, keepdim=True)
+    _, _, Vh = torch.linalg.svd(X - mu, full_matrices=False)
+    return mu, Vh[:r].T
+
+
+def stack_flat(k_pre, v_pre):
+    """(L, kvh, T, hd) x2 -> (T, 2*L*kvh*hd)"""
+    L, kvh, T, hd = k_pre.shape
+    f = lambda x: x.permute(2, 0, 1, 3).reshape(T, L * kvh * hd)
+    return torch.cat([f(k_pre), f(v_pre)], dim=1)
+
+
+def stack_unflat(X, L, kvh, hd):
+    T = X.shape[0]
+    half = L * kvh * hd
+    g = lambda x: x.reshape(T, L, kvh, hd).permute(1, 2, 0, 3).contiguous()
+    return g(X[:, :half]), g(X[:, half:])
+
+
+def fit_joint(k_pre, v_pre, fit_len, R):
+    X = stack_flat(k_pre, v_pre)
+    std = X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
+    mu, W = pca_fit(X[:fit_len] / std, R)
+    return {"std": std, "mu": mu, "W": W}
+
+
+def apply_joint(codec, k_pre, v_pre, coeff_bits=16, keep_ranks=None):
+    """keep_ranks: optional (T,) per-token component budget (A6 adaptive)."""
+    L, kvh, _, hd = k_pre.shape
+    Xs = stack_flat(k_pre, v_pre) / codec["std"]
+    Z = (Xs - codec["mu"]) @ codec["W"]
+    if coeff_bits < 16:
+        Z = qsim(Z, coeff_bits, dim=0)
+    if keep_ranks is not None:
+        mask = torch.arange(Z.shape[1]).unsqueeze(0) < keep_ranks.unsqueeze(1)
+        Z = Z * mask
+    Xh = (Z @ codec["W"].T + codec["mu"]) * codec["std"]
+    return stack_unflat(Xh, L, kvh, hd)
+
+
+def fit_traj(hidden, fit_len, R):
+    L1, T, D = hidden.shape
+    X = hidden.permute(1, 0, 2).reshape(T, L1 * D)
+    std = X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
+    mu, W = pca_fit(X[:fit_len] / std, R)
+    return {"std": std, "mu": mu, "W": W, "shape": (L1, D)}
+
+
+def apply_traj(codec, hidden, coeff_bits=16):
+    L1, T, D = hidden.shape
+    Xs = hidden.permute(1, 0, 2).reshape(T, L1 * D) / codec["std"]
+    Z = (Xs - codec["mu"]) @ codec["W"]
+    if coeff_bits < 16:
+        Z = qsim(Z, coeff_bits, dim=0)
+    Xh = (Z @ codec["W"].T + codec["mu"]) * codec["std"]
+    return Xh.reshape(T, L1, D).permute(1, 0, 2).contiguous()
+
+
 def behavior_metrics(base_logits, comp_logits, target_ids):
     """base/comp: (W, vocab). target_ids: (W-1,) true next tokens for the first
     W-1 window positions."""
