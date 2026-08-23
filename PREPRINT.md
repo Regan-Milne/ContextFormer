@@ -1,11 +1,14 @@
 # One Object per Token: Behavior-Weighted Compression of the Cross-Layer KV Stack on Frozen LLMs
 
 **Author:** Regan Milne (github.com/Regan-Milne)
-**Date:** 2026-08-23 (draft; not yet released)
-**Status:** DRAFT. Of two pre-registered gates, the corpus-basis test (§6.2)
-is complete (failed; reported verbatim — the 16× figure is long-context
-only, pending a learned encoder) and the scale-transfer gate (§8) is
-pending and will be reported regardless of outcome. This document will serve as a timestamped disclosure of the
+**Date:** 2026-08-23
+**Status:** Preprint / technical report; quiet timestamped disclosure of the
+mechanism and small-scale results. Of two pre-registered gates, the
+corpus-basis test (§6.2) is complete (failed; reported verbatim — the 16×
+figure is long-context only, pending a learned encoder) and the
+scale-transfer gate (§8) is pending. This document is updated in place;
+gate outcomes will be reported here regardless of result, and this
+disclosure will not be withdrawn. This document will serve as a timestamped disclosure of the
 mechanism and results upon release.
 **License (this document & the forthcoming code):** Apache-2.0.
 
