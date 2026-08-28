@@ -3,5 +3,6 @@
 | method | total | gold-NLL | confusable | identifier | number | person | uuid |
 |---|---|---|---|---|---|---|---|
 | full KV | 14/14 | 0.151 | 2/2 | 3/3 | 3/3 | 3/3 | 3/3 |
-| behavioral 16x (rank 768 c8) | 14/14 | 0.121 | 2/2 | 3/3 | 3/3 | 3/3 | 3/3 |
-| behavioral 32x (rank 384 c8) | 11/14 | 0.188 | 1/2 | 1/3 | 3/3 | 3/3 | 3/3 |
+| nondiag 16x (rank 768 c8) | 14/14 | 0.127 | 2/2 | 3/3 | 3/3 | 3/3 | 3/3 |
+| nondiag 32x (rank 384 c8) | 13/14 | 0.134 | 2/2 | 2/3 | 3/3 | 3/3 | 3/3 |
+| nondiag 64x (rank 192 c8) | 0/14 | 4.139 | 0/2 | 0/3 | 0/3 | 0/3 | 0/3 |

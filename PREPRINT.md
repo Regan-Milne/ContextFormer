@@ -40,12 +40,16 @@ codec (PCA), three matched-bytes results:
    quantifies how much behavioral fidelity that costs here, and extends the
    cross-layer observation from adjacent pairs and layer groups to the full
    stack of a single token.
-2. **Behavioral metric.** Variance (PCA energy) is the wrong objective:
-   rank-vs-quality is *non-monotone* under it (rank 192 is far worse than
-   rank 96), an artifact that vanishes under a simple behavior-weighted
-   metric — K channels weighted by the rms of the queries that will probe
-   them, V channels by o_proj column norms. The behavioral metric also
-   converts a failing exact-recall score into a passing one (below).
+2. **Behavioral metric.** *Standardized* PCA (per-dimension variance
+   normalization, the common default) is behavior-misordered: quality is
+   non-monotone in rank, and at matched bytes it destroys exact recall that
+   raw (magnitude-weighted) PCA preserves — while scoring *lower* KL, a
+   second metric/recall dissociation. Raw PCA works largely by accident
+   (magnitude correlates with the query-probed key channels); an explicit
+   behavior-weighted metric — K channels by the rms of the queries that
+   will probe them, V channels by o_proj column norms, or their
+   non-diagonal gram generalizations — is the principled form, and wins at
+   stressed ranks where raw PCA and standardization both fail.
 3. **K/V coupling.** Giving K and V separate bases — even with K favored,
    even under the behavioral metric — collapses exact recall to 0/8 at
    matched bytes. Cutting the stack along the K/V seam is as destructive as
@@ -94,9 +98,11 @@ comparison. Against that background, the specific claims of this report are:
    K and V (as prior factorization methods do) destroys exact recall in our
    setup (§5).
 3. **Behavior-weighted component selection**, where importance derives from
-   how perturbations affect attention and output rather than from variance —
-   including the observation that variance ordering is behavior-*misordered*
-   (non-monotone) in this model (§4).
+   how perturbations affect attention and output — including the
+   observation that *standardized*-PCA ordering is behavior-misordered
+   (non-monotone) in this model, that raw magnitude-weighting captures much
+   of the behavioral effect by accident, and that explicit behavioral
+   weighting is the principled form that wins at stressed ranks (§4, §7).
 4. **Exact-detail recall as a mandatory metric**, with a demonstration that
    low KL can coexist with catastrophic retrieval failure (§4a).
 5. **Document-adaptive structure**, quantified same-document vs foreign vs
@@ -182,11 +188,17 @@ behavior and addressable detail dissociate completely; results quoted on
 KL/perplexity alone can be arbitrarily misleading about whether the model
 can still *find things*.
 
-**(b) Variance-ordered components are behavior-misordered.** Under the
-variance metric, quality is non-monotone in rank: rank 192 (KL 6.54) is far
-worse than rank 96 (KL 4.34). Partially reconstructing a direction that
-attention logits are sensitive to misdirects retrieval worse than omitting
-it. We replace the metric with a diagonal behavioral one:
+**(b) Standardized-PCA components are behavior-misordered.** Under
+per-dimension variance normalization (the common default before PCA),
+quality is non-monotone in rank: rank 192 (KL 6.54) is far worse than rank
+96 (KL 4.34), and at rank 384 the standardized codec recalls 1/8 while
+*raw* (unnormalized) PCA at identical bytes recalls 8/8 — despite the
+standardized codec's lower KL, a second dissociation. Partially
+reconstructing a direction attention is sensitive to misdirects retrieval
+worse than omitting it, and standardization inflates exactly the wrong
+directions while suppressing the high-magnitude query-probed key channels
+that raw PCA keeps by accident. We replace the metric with an explicit
+diagonal behavioral one:
 
 - **K channels** weighted by the rms of the post-RoPE *queries* that will
   probe them (pooled over the query heads sharing each KV head,
@@ -327,6 +339,39 @@ follow-ups sharpen the frontier above:
   basis storage) destroys recall — 2/24 at 16×. The basis, like the keys it
   reconstructs, is precision-critical; all net-ratio figures in this
   document therefore assume an fp16 basis.
+
+**Overnight follow-ups (C-suite, same date).** Five further results, the
+sharp ones first:
+
+- **Decode-time viability (held-out tokens):** a basis fit on only the first
+  60% of the document, applied to everything including needles planted
+  *beyond* the fit boundary: 7/8 recall (gold-NLL 0.229 vs 0.130). Bases
+  generalize forward to tokens that did not exist at fit time — the
+  deployment shape — with a measurable but modest penalty.
+- **Rank vs context length is sublinear so far:** rank 768 covers ~1.9k
+  tokens (24/24); at ~7.5k, +50% rank (1152, 10.7× marginal) recovers 15/16
+  where 768 held 14/16 — and doubling to 1536 adds nothing: the last miss is
+  rank-*insensitive* (fails at 8× too; full KV passes), so the residual
+  failure mode at length is not capacity.
+- **Metric resolution (the C4 showdown):** the villain behind the
+  non-monotonicity is *standardization* specifically; raw PCA matches the
+  behavioral metric at 16–32× on simple needles; the metrics separate on the
+  typed battery at 32× (non-diagonal 13/14 > diagonal behavioral 11/14 >
+  full KV reference 14/14) and at rank 192, where behavioral (2/8) beats
+  raw, standardized, and non-diagonal (all 0/8). **64× is a hard wall for
+  every linear codec tested.**
+- **Typed-needle battery:** at 16×, both behavioral and non-diagonal codecs
+  recall 14/14 across numbers, UUIDs, code identifiers, person names, and
+  confusable near-collision pairs; at 32× the failures concentrate exactly
+  where key-precision theory predicts (identifiers, confusables).
+- **Token-level conditional coding (linear pilot): null.** Predicting a
+  token's code from previous tokens' codes explains less held-out variance
+  than token identity alone, and at matched bytes all conditional variants
+  lose behaviorally to unconditional quantization. Combined with §6, the
+  context that enables compression appears to be *document-global* (which
+  subspace) rather than *local-sequential* (predict the next code) — a
+  design steer for the learned codecs of §8, not a closed question: the
+  pilot is linear and underpowered by construction.
 
 Additional measured structure: per-token residuals are thin-tailed (99th
 percentile 0.153 vs median 0.092 at rank 384) — under linear codecs there is
