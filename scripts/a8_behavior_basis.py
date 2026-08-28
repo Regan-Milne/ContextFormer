@@ -29,44 +29,10 @@ from common import (load_model, load_capture, pre_rope_kv, rope_k, eval_window,
 from a7_needle import NEEDLES, build_doc, probe_needle
 
 
-def pair_symmetrize(w):
-    """RoPE rotates channel pairs (i, i+hd/2); equalize weights within pairs
-    so the diagonal metric commutes with the rotation."""
-    half = w.shape[-1] // 2
-    m = (w[..., :half] + w[..., half:]) / 2
-    return torch.cat([m, m], dim=-1)
-
-
-@torch.no_grad()
-def behavioral_weights(model, hidden):
-    """Returns wK, wV: (L, kvh, hd) channel sensitivities."""
-    cfg = model.config
-    nh, kvh = cfg.num_attention_heads, cfg.num_key_value_heads
-    hd = cfg.hidden_size // nh
-    n_rep = nh // kvh
-    L1, T, D = hidden.shape
-    pos = torch.arange(T).unsqueeze(0)
-    dummy = torch.zeros(1, T, D)
-    cos, sin = model.model.rotary_emb(dummy, pos)
-    wK, wV = [], []
-    for l, layer in enumerate(model.model.layers):
-        x = layer.input_layernorm(hidden[l].unsqueeze(0))
-        q = layer.self_attn.q_proj(x).view(1, T, nh, hd).transpose(1, 2)
-        q, _ = apply_rotary_pos_emb(q, q, cos, sin)
-        qrms = q.squeeze(0).pow(2).mean(1).sqrt()            # (nh, hd)
-        wK.append(pair_symmetrize(qrms.view(kvh, n_rep, hd).mean(1)))
-        Wo = layer.self_attn.o_proj.weight                    # (D, nh*hd)
-        onorm = Wo.view(D, nh, hd).norm(dim=0)                # (nh, hd)
-        wV.append(onorm.view(kvh, n_rep, hd).mean(1))
-    return torch.stack(wK), torch.stack(wV)
-
-
-def metric_scale(wK, wV):
-    """Flatten (L, kvh, hd) weights into the stack_flat layout and return the
-    'std' replacement (1/sensitivity)."""
-    w = torch.cat([wK.reshape(1, -1), wV.reshape(1, -1)], dim=1)
-    w = w / w.mean()
-    return 1.0 / w.clamp_min(1e-3)
+# behavioral_weights / metric_scale now live in common.py (version- and
+# architecture-robust: Qwen3 q_norm/head_dim, device/dtype aware); re-exported
+# here so older scripts keep importing from this module.
+from common import behavioral_weights, metric_scale  # noqa: F401,E402
 
 
 def main():

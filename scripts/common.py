@@ -1,97 +1,247 @@
-"""Shared Phase 1 machinery: capture loading, pre-RoPE KV recompute,
-cache surgery, two-pass behavioral evaluation."""
+"""Shared harness: capture, pre-RoPE KV recompute, cache surgery, two-pass
+behavioral evaluation, analytic codecs.
+
+Version- and architecture-robust by design:
+  - transformers 4.45 (laptop, Qwen2.5) through current (4090, Qwen3+):
+    cache construction/reading goes through compat shims, not legacy APIs.
+  - Qwen3-family differences handled: config.head_dim decoupled from
+    hidden_size/num_heads, and per-head q_norm/k_norm applied before RoPE.
+  - Device/dtype aware: CPU fp32 by default; CUDA + bf16 for the scale gate.
+    Codec math always runs in fp32; caches are cast to model dtype on build.
+
+The safety net for any port is scripts/smoke.py: if the pre-RoPE recompute
+matches the model's real cache, the harness understands the architecture.
+"""
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
 
+try:
+    from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+except ImportError:  # future refactor fallback: identical function in llama
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
-def load_model(name="Qwen/Qwen2.5-0.5B"):
-    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch.float32)
+
+# ---------------------------- model / geometry ----------------------------
+
+def load_model(name="Qwen/Qwen2.5-0.5B", dtype=None, device=None):
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    if dtype is None:
+        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=dtype)
+    model.to(device)
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
     return model
 
 
+def head_dim(cfg):
+    """Qwen3+ sets head_dim explicitly and it need not equal hidden/heads."""
+    hd = getattr(cfg, "head_dim", None)
+    return hd if hd else cfg.hidden_size // cfg.num_attention_heads
+
+
+def kv_geometry(cfg):
+    """(L, kvh, hd, stack_dim, fp16_bytes_per_token)"""
+    L, kvh, hd = cfg.num_hidden_layers, cfg.num_key_value_heads, head_dim(cfg)
+    stack_dim = 2 * L * kvh * hd
+    return L, kvh, hd, stack_dim, stack_dim * 2
+
+
+# ------------------------------ cache compat ------------------------------
+
+def make_cache(pairs):
+    """DynamicCache from an iterable of (k, v), each (1, kvh, T, hd)."""
+    cache = DynamicCache()
+    for i, (k, v) in enumerate(pairs):
+        cache.update(k, v, i)
+    return cache
+
+
+def cache_kv(pkv):
+    """List of (k, v) per layer from whatever cache object the model returned."""
+    if hasattr(pkv, "layers"):          # newer transformers
+        return [(l.keys, l.values) for l in pkv.layers]
+    if hasattr(pkv, "key_cache"):       # 4.4x-4.5x DynamicCache
+        return list(zip(pkv.key_cache, pkv.value_cache))
+    if hasattr(pkv, "to_legacy_cache"):
+        return list(pkv.to_legacy_cache())
+    return list(pkv)                    # legacy tuple
+
+
+def build_cache(keys, values, past_len, model):
+    """Cache from (L, kvh, T, hd) tensors truncated to past_len, cast to the
+    model's device/dtype."""
+    dt, dev = model.dtype, next(model.parameters()).device
+    return make_cache(
+        (keys[l, :, :past_len].unsqueeze(0).to(device=dev, dtype=dt).contiguous(),
+         values[l, :, :past_len].unsqueeze(0).to(device=dev, dtype=dt).contiguous())
+        for l in range(keys.shape[0])
+    )
+
+
+# --------------------------- capture / recompute ---------------------------
+
 def load_capture(path):
+    """Phase-0 on-disk capture (fp16) -> fp32 tensors."""
     cap = torch.load(path)
-    cap["hidden"] = cap["hidden"].float()    # (L+1, T, D)
-    cap["keys"] = cap["keys"].float()        # (L, kvh, T, hd) post-RoPE
+    cap["hidden"] = cap["hidden"].float()
+    cap["keys"] = cap["keys"].float()
     cap["values"] = cap["values"].float()
     return cap
 
 
+@torch.no_grad()
+def prefill_doc(model, ids):
+    """Full prefill. Returns hidden (L+1,T,D), keys/values (L,kvh,T,hd) as the
+    attention actually used them (post-RoPE, post-norm), logits (T,V). All
+    fp32 on CPU regardless of model dtype/device."""
+    dev = next(model.parameters()).device
+    out = model(ids.to(dev), output_hidden_states=True, use_cache=True)
+    kv = cache_kv(out.past_key_values)
+    keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
+    values = torch.stack([v.squeeze(0).float().cpu() for _, v in kv])
+    hidden = torch.stack([h.squeeze(0).float().cpu() for h in out.hidden_states])
+    return hidden, keys, values, out.logits.squeeze(0).float().cpu()
+
+
+def _proj_kv(layer, h, kvh, hd):
+    """One layer's pre-RoPE K and V from its input hidden state (1, T, D),
+    including Qwen3-style per-head k_norm when present."""
+    attn = layer.self_attn
+    T = h.shape[1]
+    x = layer.input_layernorm(h)
+    k = attn.k_proj(x).view(1, T, kvh, hd)
+    if hasattr(attn, "k_norm"):
+        k = attn.k_norm(k)
+    v = attn.v_proj(x).view(1, T, kvh, hd)
+    return k.transpose(1, 2), v.transpose(1, 2)
+
+
+@torch.no_grad()
 def pre_rope_kv(model, hidden):
-    """Pre-RoPE K and V for all layers from the hidden trajectory.
-    hidden: (L+1, T, D). Returns k_pre, v: (L, kvh, T, hd)."""
+    """Pre-RoPE K and V for all layers from the (L+1, T, D) fp32 trajectory.
+    Returns fp32 CPU tensors (L, kvh, T, hd). Computation runs in the model's
+    dtype/device so it matches the cache bit-for-bit."""
     cfg = model.config
-    kvh = cfg.num_key_value_heads
-    hd = cfg.hidden_size // cfg.num_attention_heads
-    T = hidden.shape[1]
+    kvh, hd = cfg.num_key_value_heads, head_dim(cfg)
+    dev, dt = next(model.parameters()).device, model.dtype
     ks, vs = [], []
-    with torch.no_grad():
-        for l, layer in enumerate(model.model.layers):
-            x = layer.input_layernorm(hidden[l].unsqueeze(0))
-            k = layer.self_attn.k_proj(x).view(1, T, kvh, hd).transpose(1, 2)
-            v = layer.self_attn.v_proj(x).view(1, T, kvh, hd).transpose(1, 2)
-            ks.append(k.squeeze(0))
-            vs.append(v.squeeze(0))
+    for l, layer in enumerate(model.model.layers):
+        h = hidden[l].unsqueeze(0).to(device=dev, dtype=dt)
+        k, v = _proj_kv(layer, h, kvh, hd)
+        ks.append(k.squeeze(0).float().cpu())
+        vs.append(v.squeeze(0).float().cpu())
     return torch.stack(ks), torch.stack(vs)
 
 
+@torch.no_grad()
 def rope_k(model, k_pre, position_ids):
-    """Apply RoPE to pre-RoPE keys. k_pre: (L, kvh, T, hd)."""
-    with torch.no_grad():
-        dummy = torch.zeros(1, k_pre.shape[2], model.config.hidden_size)
-        cos, sin = model.model.rotary_emb(dummy, position_ids)
-        out = []
-        for l in range(k_pre.shape[0]):
-            _, k = apply_rotary_pos_emb(k_pre[l].unsqueeze(0), k_pre[l].unsqueeze(0), cos, sin)
-            out.append(k.squeeze(0))
+    """Apply RoPE to pre-RoPE keys (L, kvh, T, hd), fp32 in/out."""
+    cfg = model.config
+    dev = next(model.parameters()).device
+    T = k_pre.shape[2]
+    dummy = torch.zeros(1, T, cfg.hidden_size, device=dev, dtype=torch.float32)
+    cos, sin = model.model.rotary_emb(dummy, position_ids.to(dev))
+    cos, sin = cos.float().cpu(), sin.float().cpu()
+    out = []
+    for l in range(k_pre.shape[0]):
+        _, k = apply_rotary_pos_emb(k_pre[l].unsqueeze(0), k_pre[l].unsqueeze(0),
+                                    cos, sin)
+        out.append(k.squeeze(0))
     return torch.stack(out)
 
 
-def build_cache(keys, values, past_len):
-    """Legacy-format cache from (L, kvh, T, hd) tensors, truncated to past_len."""
-    legacy = tuple(
-        (keys[l, :, :past_len].unsqueeze(0).contiguous(),
-         values[l, :, :past_len].unsqueeze(0).contiguous())
-        for l in range(keys.shape[0])
-    )
-    return DynamicCache.from_legacy_cache(legacy)
-
+# ------------------------------- evaluation -------------------------------
 
 @torch.no_grad()
 def eval_window(model, ids, keys, values, past_len):
-    """Feed tokens [past_len:] with the given (possibly compressed) cache as
-    past. Returns logits over the window. keys/values are post-RoPE (L, kvh, T, hd)."""
+    """Feed tokens [past_len:] against the given (possibly reconstructed)
+    post-RoPE cache. Returns fp32 CPU logits over the window."""
+    dev = next(model.parameters()).device
     T = ids.shape[1]
-    cache = build_cache(keys, values, past_len)
     out = model(
-        input_ids=ids[:, past_len:],
-        past_key_values=cache,
-        attention_mask=torch.ones(1, T, dtype=torch.long),
-        position_ids=torch.arange(past_len, T).unsqueeze(0),
-        use_cache=False,
+        input_ids=ids[:, past_len:].to(dev),
+        past_key_values=build_cache(keys, values, past_len, model),
+        attention_mask=torch.ones(1, T, dtype=torch.long, device=dev),
+        position_ids=torch.arange(past_len, T, device=dev).unsqueeze(0),
+        use_cache=True,
     )
-    return out.logits.squeeze(0).float()   # (T - past_len, vocab)
+    return out.logits.squeeze(0).float().cpu()
+
+
+def behavior_metrics(base_logits, comp_logits, target_ids):
+    base_lp = torch.log_softmax(base_logits, dim=-1)
+    comp_lp = torch.log_softmax(comp_logits, dim=-1)
+    kl = (base_lp.exp() * (base_lp - comp_lp)).sum(-1)
+    top1 = (base_logits.argmax(-1) == comp_logits.argmax(-1)).float()
+    b5 = base_logits.topk(5, dim=-1).indices
+    c5 = comp_logits.topk(5, dim=-1).indices
+    top5 = torch.tensor([len(set(b5[i].tolist()) & set(c5[i].tolist())) / 5.0
+                         for i in range(b5.shape[0])])
+    n = target_ids.shape[0]
+    tgt = target_ids.unsqueeze(1)
+    base_nll = -base_lp[:n].gather(1, tgt).squeeze(1)
+    comp_nll = -comp_lp[:n].gather(1, tgt).squeeze(1)
+    return {
+        "kl_mean": kl.mean().item(),
+        "kl_p95": kl.quantile(0.95).item(),
+        "top1_agree": top1.mean().item(),
+        "top5_overlap": top5.mean().item(),
+        "base_nll": base_nll.mean().item(),
+        "delta_nll": (comp_nll - base_nll).mean().item(),
+    }
+
+
+# ------------------------ behavioral metric weights ------------------------
+
+def _pair_symmetrize(w):
+    half = w.shape[-1] // 2
+    m = (w[..., :half] + w[..., half:]) / 2
+    return torch.cat([m, m], dim=-1)
 
 
 @torch.no_grad()
-def prefill_doc(model, ids):
-    """Full prefill returning hidden trajectory, post-RoPE KV, and logits."""
-    out = model(ids, output_hidden_states=True, use_cache=True)
-    pkv = out.past_key_values
-    legacy = pkv.to_legacy_cache() if hasattr(pkv, "to_legacy_cache") else pkv
-    keys = torch.stack([kv[0].squeeze(0) for kv in legacy]).float()
-    values = torch.stack([kv[1].squeeze(0) for kv in legacy]).float()
-    hidden = torch.stack([h.squeeze(0) for h in out.hidden_states]).float()
-    return hidden, keys, values, out.logits.squeeze(0).float()
+def behavioral_weights(model, hidden):
+    """(wK, wV), each (L, kvh, hd): K channels by pooled post-RoPE query rms
+    (pair-symmetrized so the diagonal metric commutes with RoPE); V channels
+    by o_proj column norms. Handles Qwen3 q_norm."""
+    cfg = model.config
+    nh, kvh, hd = cfg.num_attention_heads, cfg.num_key_value_heads, head_dim(cfg)
+    n_rep = nh // kvh
+    dev, dt = next(model.parameters()).device, model.dtype
+    L1, T, D = hidden.shape
+    pos = torch.arange(T, device=dev).unsqueeze(0)
+    dummy = torch.zeros(1, T, D, device=dev, dtype=torch.float32)
+    cos, sin = model.model.rotary_emb(dummy, pos)
+    wK, wV = [], []
+    for l, layer in enumerate(model.model.layers):
+        attn = layer.self_attn
+        h = hidden[l].unsqueeze(0).to(device=dev, dtype=dt)
+        x = layer.input_layernorm(h)
+        q = attn.q_proj(x).view(1, T, nh, hd)
+        if hasattr(attn, "q_norm"):
+            q = attn.q_norm(q)
+        q = q.transpose(1, 2).float()
+        q, _ = apply_rotary_pos_emb(q, q, cos.float(), sin.float())
+        qrms = q.squeeze(0).pow(2).mean(1).sqrt().cpu()              # (nh, hd)
+        wK.append(_pair_symmetrize(qrms.view(kvh, n_rep, hd).mean(1)))
+        Wo = attn.o_proj.weight.float().cpu()                        # (D, nh*hd)
+        onorm = Wo.view(Wo.shape[0], nh, hd).norm(dim=0)
+        wV.append(onorm.view(kvh, n_rep, hd).mean(1))
+    return torch.stack(wK), torch.stack(wV)
 
 
-# ---------------- analytic codecs (shared by A5/A6/A7 scripts) ----------------
+def metric_scale(wK, wV):
+    w = torch.cat([wK.reshape(1, -1), wV.reshape(1, -1)], dim=1)
+    w = w / w.mean()
+    return 1.0 / w.clamp_min(1e-3)
+
+
+# ------------------------------ analytic codec ------------------------------
 
 def qsim(x, bits, dim):
     qmax = 2 ** (bits - 1) - 1
@@ -106,7 +256,6 @@ def pca_fit(X, r):
 
 
 def stack_flat(k_pre, v_pre):
-    """(L, kvh, T, hd) x2 -> (T, 2*L*kvh*hd)"""
     L, kvh, T, hd = k_pre.shape
     f = lambda x: x.permute(2, 0, 1, 3).reshape(T, L * kvh * hd)
     return torch.cat([f(k_pre), f(v_pre)], dim=1)
@@ -120,9 +269,6 @@ def stack_unflat(X, L, kvh, hd):
 
 
 def fit_joint(k_pre, v_pre, fit_len, R, scale=None):
-    """scale: optional (1, D) tensor replacing the variance normalizer -- PCA
-    then minimizes error under the metric ||x/scale|| instead of whitened L2.
-    Pass scale = 1/behavioral_sensitivity for behavior-weighted compression."""
     X = stack_flat(k_pre, v_pre)
     std = scale if scale is not None else \
         X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
@@ -131,7 +277,6 @@ def fit_joint(k_pre, v_pre, fit_len, R, scale=None):
 
 
 def apply_joint(codec, k_pre, v_pre, coeff_bits=16, keep_ranks=None):
-    """keep_ranks: optional (T,) per-token component budget (A6 adaptive)."""
     L, kvh, _, hd = k_pre.shape
     Xs = stack_flat(k_pre, v_pre) / codec["std"]
     Z = (Xs - codec["mu"]) @ codec["W"]
@@ -162,26 +307,7 @@ def apply_traj(codec, hidden, coeff_bits=16):
     return Xh.reshape(T, L1, D).permute(1, 0, 2).contiguous()
 
 
-def behavior_metrics(base_logits, comp_logits, target_ids):
-    """base/comp: (W, vocab). target_ids: (W-1,) true next tokens for the first
-    W-1 window positions."""
-    base_lp = torch.log_softmax(base_logits, dim=-1)
-    comp_lp = torch.log_softmax(comp_logits, dim=-1)
-    kl = (base_lp.exp() * (base_lp - comp_lp)).sum(-1)
-    top1 = (base_logits.argmax(-1) == comp_logits.argmax(-1)).float()
-    b5 = base_logits.topk(5, dim=-1).indices
-    c5 = comp_logits.topk(5, dim=-1).indices
-    top5_overlap = torch.tensor([
-        len(set(b5[i].tolist()) & set(c5[i].tolist())) / 5.0 for i in range(b5.shape[0])
-    ])
-    n = target_ids.shape[0]
-    base_nll = -base_lp[:n].gather(1, target_ids.unsqueeze(1)).squeeze(1)
-    comp_nll = -comp_lp[:n].gather(1, target_ids.unsqueeze(1)).squeeze(1)
-    return {
-        "kl_mean": kl.mean().item(),
-        "kl_p95": kl.quantile(0.95).item(),
-        "top1_agree": top1.mean().item(),
-        "top5_overlap": top5_overlap.mean().item(),
-        "base_nll": base_nll.mean().item(),
-        "delta_nll": (comp_nll - base_nll).mean().item(),
-    }
+def behavioral_codec(model, hidden, k_pre, v_pre, fit_len, R):
+    """One-call convenience: behavioral weights + joint fit."""
+    wK, wV = behavioral_weights(model, hidden)
+    return fit_joint(k_pre, v_pre, fit_len, R, scale=metric_scale(wK, wV))

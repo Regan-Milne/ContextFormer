@@ -40,42 +40,50 @@ def build_doc(tok, filler_text, chunk_tokens=190):
 
 
 @torch.no_grad()
-def probe_needle(model, tok, keys, values, past_len, name, gold_num):
+def probe_needle(model, tok, keys, values, past_len, name, gold_num,
+                 query_template=None):
     """Feed the retrieval prompt against the given cache; greedy-decode and
-    teacher-force the gold continuation. Returns (exact_match, gold_nll)."""
-    q_ids = tok(QUERY.format(name), return_tensors="pt").input_ids
-    gold_ids = tok(" " + gold_num, return_tensors="pt").input_ids.squeeze(0)
-    total0 = past_len + q_ids.shape[1]
+    teacher-force the gold continuation. Returns (exact_match, gold_nll).
+    Device/dtype-safe: inputs are moved to the model's device; the cache is
+    cast by build_cache."""
+    dev = next(model.parameters()).device
+    query = (query_template or QUERY).format(name)
+    q_ids = tok(query, return_tensors="pt").input_ids.to(dev)
+    gold_ids = tok(" " + gold_num, return_tensors="pt").input_ids.squeeze(0).to(dev)
 
-    # teacher-forced NLL of gold digits
-    cache = build_cache(keys, values, past_len)
+    # teacher-forced NLL of the gold continuation
+    cache = build_cache(keys, values, past_len, model)
     tf_ids = torch.cat([q_ids, gold_ids.unsqueeze(0)], dim=1)
     out = model(input_ids=tf_ids, past_key_values=cache,
-                attention_mask=torch.ones(1, past_len + tf_ids.shape[1], dtype=torch.long),
-                position_ids=torch.arange(past_len, past_len + tf_ids.shape[1]).unsqueeze(0),
-                use_cache=False)
-    lp = torch.log_softmax(out.logits.squeeze(0).float(), dim=-1)
+                attention_mask=torch.ones(1, past_len + tf_ids.shape[1],
+                                          dtype=torch.long, device=dev),
+                position_ids=torch.arange(past_len, past_len + tf_ids.shape[1],
+                                          device=dev).unsqueeze(0),
+                use_cache=True)
+    lp = torch.log_softmax(out.logits.squeeze(0).float(), dim=-1).cpu()
     n = gold_ids.shape[0]
     nll = -lp[q_ids.shape[1] - 1:q_ids.shape[1] - 1 + n].gather(
-        1, gold_ids.unsqueeze(1)).mean().item()
+        1, gold_ids.unsqueeze(1).cpu()).mean().item()
 
-    # greedy decode
-    cache = build_cache(keys, values, past_len)
+    # greedy decode (free-running for the answer span)
+    cache = build_cache(keys, values, past_len, model)
     ids = q_ids
     generated = []
     pos = past_len
     for step in range(n + 2):
         out = model(input_ids=ids, past_key_values=cache,
-                    attention_mask=torch.ones(1, pos + ids.shape[1], dtype=torch.long),
-                    position_ids=torch.arange(pos, pos + ids.shape[1]).unsqueeze(0),
+                    attention_mask=torch.ones(1, pos + ids.shape[1],
+                                              dtype=torch.long, device=dev),
+                    position_ids=torch.arange(pos, pos + ids.shape[1],
+                                              device=dev).unsqueeze(0),
                     use_cache=True)
         cache = out.past_key_values
         pos += ids.shape[1]
         nxt = out.logits[0, -1].argmax().item()
         generated.append(nxt)
-        ids = torch.tensor([[nxt]])
+        ids = torch.tensor([[nxt]], device=dev)
     text = tok.decode(generated)
-    exact = text.strip().startswith(gold_num)
+    exact = text.strip().startswith(gold_num.strip())
     return exact, nll
 
 
