@@ -114,6 +114,9 @@ def main():
     ap.add_argument("--per-type", type=int, default=3)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--ratios", default="16,32")
+    ap.add_argument("--metric", default="behavioral",
+                    choices=["behavioral", "variance", "raw", "nondiag"],
+                    help="codec metric for the main methods")
     ap.add_argument("--variance-control", action="store_true",
                     help="also run the variance-metric codec at each ratio")
     ap.add_argument("--report-dir", default="reports")
@@ -140,21 +143,32 @@ def main():
     methods = [("full KV", None, None)]
     for ratio in [int(r) for r in args.ratios.split(",")]:
         R = min(fp16_b // ratio, T - 8, stack_dim - 8)   # int8 coeffs: R bytes/tok
-        methods.append((f"behavioral {ratio}x (rank {R} c8)", R, "behavioral"))
-        if args.variance_control:
+        methods.append((f"{args.metric} {ratio}x (rank {R} c8)", R, args.metric))
+        if args.variance_control and args.metric != "variance":
             methods.append((f"variance {ratio}x (rank {R} c8)", R, "variance"))
 
+    grams = None
     rows = {}
     for name, R, metric in methods:
         if R is None:
             keys, values = keys_t, values_t
         else:
+            from common import fit_joint, stack_flat
             if metric == "behavioral":
                 codec = behavioral_codec(model, hidden, k_pre, v_pre, T, R)
-            else:
-                from common import fit_joint
+                kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
+            elif metric == "variance":
                 codec = fit_joint(k_pre, v_pre, T, R)
-            kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
+                kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
+            elif metric == "raw":
+                ones = torch.ones(1, stack_flat(k_pre, v_pre).shape[1])
+                codec = fit_joint(k_pre, v_pre, T, R, scale=ones)
+                kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
+            else:  # nondiag
+                from c1_basis_science import block_grams, nondiag_codec
+                if grams is None:
+                    grams = block_grams(model, hidden)
+                kh, vh = nondiag_codec(k_pre, v_pre, *grams, T, R, 8)
             keys, values = rope_k(model, kh, pos), vh
         per_type = {t: [0, 0] for t in types}
         nlls = []
