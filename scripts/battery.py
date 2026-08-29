@@ -29,7 +29,7 @@ import torch
 from transformers import AutoTokenizer
 
 from common import (load_model, prefill_doc, pre_rope_kv, rope_k, kv_geometry,
-                    behavioral_codec, apply_joint)
+                    behavioral_codec, apply_joint, log)
 from a7_needle import probe_needle
 
 FIRST = ["Marlowe", "Kestrel", "Ottoline", "Bram", "Sable", "Quill", "Vesper",
@@ -120,6 +120,9 @@ def main():
     ap.add_argument("--variance-control", action="store_true",
                     help="also run the variance-metric codec at each ratio")
     ap.add_argument("--report-dir", default="reports")
+    ap.add_argument("--prefill-chunk", type=int, default=0,
+                    help="prefill in segments of N tokens (0 = one-shot); "
+                         "identical output, bounded VRAM peak")
     args = ap.parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
              "fp16": torch.float16, None: None}[args.dtype]
@@ -134,11 +137,15 @@ def main():
     T = ids.shape[1]
     types = sorted(set(nd["type"] for nd in needles))
     print(f"{args.model}: doc {T} tokens, {len(needles)} needles "
-          f"({', '.join(types)}), fp16 KV {fp16_b} B/tok")
+          f"({', '.join(types)}), fp16 KV {fp16_b} B/tok", flush=True)
 
-    hidden, keys_t, values_t, _ = prefill_doc(model, ids)
+    log(f"prefill ({T} tokens, chunk={args.prefill_chunk or 'one-shot'})...")
+    hidden, keys_t, values_t, _ = prefill_doc(model, ids,
+                                              chunk=args.prefill_chunk)
+    log("pre-RoPE KV recompute...")
     k_pre, v_pre = pre_rope_kv(model, hidden)
     pos = torch.arange(T).unsqueeze(0)
+    dev, dt = next(model.parameters()).device, model.dtype
 
     methods = [("full KV", None, None)]
     for ratio in [int(r) for r in args.ratios.split(",")]:
@@ -153,6 +160,7 @@ def main():
         if R is None:
             keys, values = keys_t, values_t
         else:
+            log(f"fit codec: {name}...")
             from common import fit_joint, stack_flat
             if metric == "behavioral":
                 codec = behavioral_codec(model, hidden, k_pre, v_pre, T, R)
@@ -170,18 +178,25 @@ def main():
                     grams = block_grams(model, hidden)
                 kh, vh = nondiag_codec(k_pre, v_pre, *grams, T, R, 8)
             keys, values = rope_k(model, kh, pos), vh
+        # mount once per method: build_cache's .to() is then a device-local
+        # no-op instead of a full fp32 stack upload per probe (2 per needle)
+        keys = keys.to(device=dev, dtype=dt)
+        values = values.to(device=dev, dtype=dt)
+        log(f"probe: {name} ({len(needles)} needles)...")
         per_type = {t: [0, 0] for t in types}
         nlls = []
-        for nd, d in zip(needles, depths):
+        for i, (nd, d) in enumerate(zip(needles, depths)):
             ok, nll = probe_needle(model, tok, keys, values, T, "",
                                    nd["gold"], query_template=nd["query"])
             per_type[nd["type"]][0] += ok
             per_type[nd["type"]][1] += 1
             nlls.append(nll)
+        del keys, values
         total = sum(v[0] for v in per_type.values())
         rows[name] = (per_type, total, len(needles), sum(nlls) / len(nlls))
         detail = "  ".join(f"{t}:{v[0]}/{v[1]}" for t, v in sorted(per_type.items()))
-        print(f"  {name:34s} {total:2d}/{len(needles)}  NLL {rows[name][3]:.3f}  {detail}")
+        print(f"  {name:34s} {total:2d}/{len(needles)}  NLL {rows[name][3]:.3f}  {detail}",
+              flush=True)
 
     slug = args.model.split("/")[-1].replace(".", "")
     rpt = os.path.join(args.report_dir, f"battery_{slug}_{T}.md")

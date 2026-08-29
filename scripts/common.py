@@ -13,9 +13,16 @@ The safety net for any port is scripts/smoke.py: if the pre-RoPE recompute
 matches the model's real cache, the harness understands the architecture.
 """
 
+import time
+
 import torch
 from transformers import AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
+
+
+def log(msg):
+    """Timestamped, flushed progress line (long runs must stay monitorable)."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 try:
     from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
@@ -95,17 +102,48 @@ def load_capture(path):
 
 
 @torch.no_grad()
-def prefill_doc(model, ids):
+def prefill_doc(model, ids, chunk=0):
     """Full prefill. Returns hidden (L+1,T,D), keys/values (L,kvh,T,hd) as the
     attention actually used them (post-RoPE, post-norm), logits (T,V). All
-    fp32 on CPU regardless of model dtype/device."""
+    fp32 on CPU regardless of model dtype/device.
+
+    chunk > 0: prefill in segments of that many tokens, offloading hidden
+    states and logits per segment so the peak device footprint is roughly
+    weights + KV + one segment (the one-shot path peaks on the full fp32
+    logits upcast: ~19 GB alone at 4B/32k). Identical output under causal
+    attention; the KV accumulates on-device across segments."""
     dev = next(model.parameters()).device
-    out = model(ids.to(dev), output_hidden_states=True, use_cache=True)
-    kv = cache_kv(out.past_key_values)
+    if not chunk:
+        out = model(ids.to(dev), output_hidden_states=True, use_cache=True)
+        kv = cache_kv(out.past_key_values)
+        keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
+        values = torch.stack([v.squeeze(0).float().cpu() for _, v in kv])
+        hidden = torch.stack([h.squeeze(0).float().cpu() for h in out.hidden_states])
+        return hidden, keys, values, out.logits.squeeze(0).float().cpu()
+    T = ids.shape[1]
+    cache = None
+    hid_parts, log_parts = [], []
+    for s in range(0, T, chunk):
+        seg = ids[:, s:s + chunk].to(dev)
+        out = model(
+            input_ids=seg,
+            past_key_values=cache,
+            attention_mask=torch.ones(1, s + seg.shape[1], dtype=torch.long,
+                                      device=dev),
+            position_ids=torch.arange(s, s + seg.shape[1],
+                                      device=dev).unsqueeze(0),
+            output_hidden_states=True, use_cache=True,
+        )
+        cache = out.past_key_values
+        hid_parts.append(torch.stack([h.squeeze(0).float().cpu()
+                                      for h in out.hidden_states]))
+        log_parts.append(out.logits.squeeze(0).float().cpu())
+        del out
+    kv = cache_kv(cache)
     keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
     values = torch.stack([v.squeeze(0).float().cpu() for _, v in kv])
-    hidden = torch.stack([h.squeeze(0).float().cpu() for h in out.hidden_states])
-    return hidden, keys, values, out.logits.squeeze(0).float().cpu()
+    return (torch.cat(hid_parts, dim=1), keys, values,
+            torch.cat(log_parts, dim=0))
 
 
 def _proj_kv(layer, h, kvh, hd):
@@ -251,7 +289,16 @@ def qsim(x, bits, dim):
 
 def pca_fit(X, r):
     mu = X.mean(0, keepdim=True)
-    _, _, Vh = torch.linalg.svd(X - mu, full_matrices=False)
+    Xc = X - mu
+    # fp32 SVD on the GPU when available: same decomposition, minutes -> seconds
+    # at gate scale (T x 147456). OOM falls back to the CPU path.
+    if torch.cuda.is_available() and Xc.numel() > 2 ** 24:
+        try:
+            _, _, Vh = torch.linalg.svd(Xc.cuda(), full_matrices=False)
+            return mu, Vh[:r].T.cpu().contiguous()
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+    _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
     return mu, Vh[:r].T
 
 
