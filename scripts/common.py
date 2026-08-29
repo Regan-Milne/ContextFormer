@@ -293,8 +293,16 @@ def pca_fit(X, r):
     mu = X.mean(0, keepdim=True)
     Xc = X - mu
     # fp32 SVD on the GPU when available: same decomposition, minutes -> seconds
-    # at gate scale (T x 147456). OOM falls back to the CPU path.
+    # at gate scale (T x 147456). OOM falls back to the CPU path. The explicit
+    # free-VRAM gate matters on Windows: WDDM pages an oversized allocation
+    # into host memory instead of throwing, and a paged SVD thrashes for
+    # hours without ever hitting the except branch.
     if torch.cuda.is_available() and Xc.numel() > 2 ** 24:
+        free, _ = torch.cuda.mem_get_info()
+        if free < 5 * Xc.numel() * 4 + 2 ** 30:
+            log("pca_fit: not enough free VRAM for GPU SVD, using CPU")
+            _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
+            return mu, Vh[:r].T
         try:
             _, _, Vh = torch.linalg.svd(Xc.cuda(), full_matrices=False)
             return mu, Vh[:r].T.cpu().contiguous()
