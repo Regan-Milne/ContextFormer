@@ -424,7 +424,48 @@ on RTX 4090-class hardware and reported regardless of outcome:
   reported as such. Anomalous runs are retained; observation is
   distinguished from explanation.
 
-> [PENDING: scale-gate results table]
+### First gate tranche: 4090, 2026-08-28 (reported as it landed)
+
+Environment: RTX 4090, bf16, torch 2.11 / transformers 5.15. Smoke
+roundtrips pass for Qwen2.5-0.5B and Qwen3-4B (K rel err 1.3e-3 and
+5.5e-4 in bf16; exact in fp32). The 0.5B typed battery reproduces on
+GPU/bf16: behavioral 16x 14/14, gold-NLL 0.122 (full KV 0.151).
+
+An accounting trap, reported before the results it invalidates: PCA rank
+is bounded by the token count T, so any row whose byte budget implies
+rank >= T is vacuous, the codec is near-exact by construction. At 4B
+(147456 B/tok fp16, int8 coefficients) 16x implies rank 9216, so 16x rows
+are informative only for T well above 9216. A 2k-token 4B battery run
+before this was understood produced all rows identical to full KV and is
+retained in reports/ as the cautionary example.
+
+Qwen3-4B, typed battery (14 needles, seed 11), informative rows only:
+
+| context | method | recall | gold-NLL |
+|---|---|---|---|
+| 8k (T=7993) | full KV | 14/14 | 0.013 |
+| 8k | behavioral 32x (rank 4608) | 14/14 | 0.019 |
+| 8k | variance 32x | 13/14 | 0.029 |
+| 8k | behavioral 64x (rank 2304) | 14/14 | 0.048 |
+| 8k | variance 64x | 12/14 | 0.076 |
+| 16k (T=15988) | full KV | 14/14 | 0.018 |
+| 16k | behavioral 16x (rank 9216) | 14/14 | 0.022 |
+
+The 16k behavioral 16x row is the ratio named in the failure criteria:
+recall intact, dNLL +0.004. Two observations, stated narrowly: (1) the
+64x collapse at 0.5B (0/14 for every linear codec) does not transfer to
+4B, which holds 14/14 at 8k; (2) the behavioral-vs-variance separation
+at 4B is directional but mild (1-2 needles, ~1.6x gold-NLL) rather than
+the 0.5B collapse; whether that reflects milder T/rank stress or genuine
+scale robustness is unresolved, and the 16k 64x rows (T/rank ~7, the
+0.5B separation regime) discriminate. Remaining 16k rows and seed-12/13
+replicates at 8k were running as this tranche was committed and will be
+appended verbatim as they land.
+
+> [PENDING from this gate: remaining 16k rows and seed replicates; a
+> second model family; 32k; the IFEval-style compliance, leakage, and
+> RULER batteries; matched-byte quantization/SVD baselines; the §6.1
+> conditional-coding context test.]
 
 Beyond the gate: a learned, context-conditioned encoder/decoder trained by
 distillation against the frozen teacher (the token-level test of the

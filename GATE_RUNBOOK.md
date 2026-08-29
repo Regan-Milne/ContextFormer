@@ -3,6 +3,15 @@
 Ordered so failures surface cheap and early. Do not skip step 2 or 3 — every
 downstream number is meaningless if the roundtrip check fails.
 
+**Status 2026-08-28:** steps 1-3 DONE (smokes PASS both models; 0.5B parity
+reproduces on GPU/bf16). Step 4 in progress: 8k complete, 16k in flight
+(PREPRINT §8 tranche table). Two lessons for anyone rerunning:
+(1) rank <= T, so 16x at 4B is only informative at 16k+ (ledger A23);
+(2) long batteries: use `python -u`, `--prefill-chunk 1024` (bounds VRAM
+peak), `--vram-frac` when sharing the GPU with anything you care about,
+and never run two batteries concurrently (the fp32 stacks at 16k plus a
+second run exceed 64 GB host RAM).
+
 ## 0. Environment (once)
 
 ```

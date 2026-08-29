@@ -206,7 +206,8 @@ def main():
               flush=True)
 
     slug = args.model.split("/")[-1].replace(".", "")
-    rpt = os.path.join(args.report_dir, f"battery_{slug}_{T}.md")
+    seed_tag = "" if args.seed == 11 else f"_s{args.seed}"
+    rpt = os.path.join(args.report_dir, f"battery_{slug}_{T}{seed_tag}.md")
     os.makedirs(args.report_dir, exist_ok=True)
     with open(rpt, "w", encoding="utf-8") as f:
         f.write(f"# Typed-needle battery -- {args.model}, {T} tokens, "
