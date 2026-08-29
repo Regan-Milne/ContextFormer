@@ -439,33 +439,61 @@ are informative only for T well above 9216. A 2k-token 4B battery run
 before this was understood produced all rows identical to full KV and is
 retained in reports/ as the cautionary example.
 
-Qwen3-4B, typed battery (14 needles, seed 11), informative rows only:
+Qwen3-4B, typed battery (14 needles per seed), informative rows only.
+16k, seed 11 (T=15988):
 
-| context | method | recall | gold-NLL |
-|---|---|---|---|
-| 8k (T=7993) | full KV | 14/14 | 0.013 |
-| 8k | behavioral 32x (rank 4608) | 14/14 | 0.019 |
-| 8k | variance 32x | 13/14 | 0.029 |
-| 8k | behavioral 64x (rank 2304) | 14/14 | 0.048 |
-| 8k | variance 64x | 12/14 | 0.076 |
-| 16k (T=15988) | full KV | 14/14 | 0.018 |
-| 16k | behavioral 16x (rank 9216) | 14/14 | 0.022 |
+| method | recall | gold-NLL |
+|---|---|---|
+| full KV | 14/14 | 0.018 |
+| behavioral 16x (rank 9216) | 14/14 | 0.022 |
+| variance 16x | 14/14 | 0.021 |
+| behavioral 32x (rank 4608) | 14/14 | 0.012 |
+| variance 32x | 14/14 | 0.020 |
+| behavioral 64x (rank 2304) | 14/14 | 0.061 |
+| variance 64x | 13/14 | 0.176 |
+
+8k, three seeds (T=7993/7992/7987; recall as s11 / s12 / s13):
+
+| method | s11 | s12 | s13 | aggregate |
+|---|---|---|---|---|
+| full KV | 14/14 (0.013) | 14/14 (0.015) | 14/14 (0.011) | 42/42 |
+| behavioral 32x | 14/14 (0.019) | 14/14 (0.015) | 14/14 (0.010) | 42/42 |
+| variance 32x | 13/14 (0.029) | 14/14 (0.012) | 14/14 (0.010) | 41/42 |
+| behavioral 64x | 14/14 (0.048) | 14/14 (0.039) | 12/14 (0.097) | 40/42 |
+| variance 64x | 12/14 (0.076) | 12/14 (0.099) | 12/14 (0.105) | 36/42 |
 
 The 16k behavioral 16x row is the ratio named in the failure criteria:
-recall intact, dNLL +0.004. Two observations, stated narrowly: (1) the
-64x collapse at 0.5B (0/14 for every linear codec) does not transfer to
-4B, which holds 14/14 at 8k; (2) the behavioral-vs-variance separation
-at 4B is directional but mild (1-2 needles, ~1.6x gold-NLL) rather than
-the 0.5B collapse; whether that reflects milder T/rank stress or genuine
-scale robustness is unresolved, and the 16k 64x rows (T/rank ~7, the
-0.5B separation regime) discriminate. Remaining 16k rows and seed-12/13
-replicates at 8k were running as this tranche was committed and will be
-appended verbatim as they land.
+recall intact, dNLL +0.004. Findings, stated narrowly:
 
-> [PENDING from this gate: remaining 16k rows and seed replicates; a
-> second model family; 32k; the IFEval-style compliance, leakage, and
-> RULER batteries; matched-byte quantization/SVD baselines; the §6.1
-> conditional-coding context test.]
+1. **The 0.5B 64x wall does not transfer.** The ratio at which every
+   linear codec recalled 0/14 at 0.5B holds 40/42 (behavioral) at 4B/8k
+   across three seeds and 14/14 at 16k. Marginal bytes/token at 64x:
+   147456 -> ~2304.
+2. **Fixed rank stretches with context.** Ranks 4608 and 2304, fit per
+   document, hold perfect recall at both 8k and 16k (seed 11); rank
+   demand at 4B is strongly sublinear in T over this range (ledger A21).
+3. **The variance collapse also does not transfer; the behavioral
+   advantage becomes a fidelity margin.** At 16k/64x (T/rank ~7, the
+   0.5B separation regime) variance recalls 13/14 rather than
+   collapsing; across seeds at 8k/64x the recall gap is 40/42 vs 36/42,
+   with per-seed variation from two needles to none (s13: identical
+   12/14, same misses, confusable and person, the pre-registered
+   failure mode). Behavioral gold-NLL is never worse and its margin
+   grows with stress (parity at 16x; ~1.7x at 32x; up to 2.9x at
+   16k/64x). The 0.5B-style recall collapse of variance ordering is a
+   small-model phenomenon on this evidence.
+4. Per A23 accounting: matched ratio does not match per-sample stress
+   across stack sizes (T/rank here 1.7-6.9 vs 4.7-9.4 in the 0.5B
+   rows); 32k extends the stress range and remains pending.
+
+> [PENDING from this gate: a second model family; 32k; the IFEval-style
+> compliance, leakage, and RULER batteries; matched-byte
+> quantization/SVD baselines; the §6.1 conditional-coding context test.
+> Net-vs-marginal accounting at 4B geometry: the fp16 per-document basis
+> is ~1.36 GB at 16x (rank 9216), ~680 MB at 32x, ~340 MB at 64x, so
+> net ratios approach marginal only at 100k+ contexts unless the basis
+> is generated rather than stored (the A4 learned-encoder direction) or
+> structurally compressed (A19 rules out naive int8).]
 
 Beyond the gate: a learned, context-conditioned encoder/decoder trained by
 distillation against the frozen teacher (the token-level test of the
