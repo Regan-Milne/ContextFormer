@@ -102,7 +102,7 @@ def load_capture(path):
 
 
 @torch.no_grad()
-def prefill_doc(model, ids, chunk=0):
+def prefill_doc(model, ids, chunk=0, want_logits=True):
     """Full prefill. Returns hidden (L+1,T,D), keys/values (L,kvh,T,hd) as the
     attention actually used them (post-RoPE, post-norm), logits (T,V). All
     fp32 on CPU regardless of model dtype/device.
@@ -119,7 +119,8 @@ def prefill_doc(model, ids, chunk=0):
         keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
         values = torch.stack([v.squeeze(0).float().cpu() for _, v in kv])
         hidden = torch.stack([h.squeeze(0).float().cpu() for h in out.hidden_states])
-        return hidden, keys, values, out.logits.squeeze(0).float().cpu()
+        logits = out.logits.squeeze(0).float().cpu() if want_logits else None
+        return hidden, keys, values, logits
     T = ids.shape[1]
     cache = None
     hid_parts, log_parts = [], []
@@ -139,13 +140,14 @@ def prefill_doc(model, ids, chunk=0):
         # this avoids a per-segment fp32 logits copy on the device
         hid_parts.append(torch.stack([h.squeeze(0).cpu().float()
                                       for h in out.hidden_states]))
-        log_parts.append(out.logits.squeeze(0).cpu().float())
+        if want_logits:
+            log_parts.append(out.logits.squeeze(0).cpu().float())
         del out
     kv = cache_kv(cache)
     keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
     values = torch.stack([v.squeeze(0).float().cpu() for _, v in kv])
     return (torch.cat(hid_parts, dim=1), keys, values,
-            torch.cat(log_parts, dim=0))
+            torch.cat(log_parts, dim=0) if want_logits else None)
 
 
 def _proj_kv(layer, h, kvh, hd):
@@ -289,9 +291,8 @@ def qsim(x, bits, dim):
     return (x / scale).round().clamp(-qmax, qmax) * scale
 
 
-def pca_fit(X, r):
-    mu = X.mean(0, keepdim=True)
-    Xc = X - mu
+def _svd_components(Xc, r):
+    """Top-r right singular vectors of an already-centered matrix."""
     # fp32 SVD on the GPU when available: same decomposition, minutes -> seconds
     # at gate scale (T x 147456). OOM falls back to the CPU path. The explicit
     # free-VRAM gate matters on Windows: WDDM pages an oversized allocation
@@ -302,15 +303,20 @@ def pca_fit(X, r):
         if free < 5 * Xc.numel() * 4 + 2 ** 30:
             log("pca_fit: not enough free VRAM for GPU SVD, using CPU")
             _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
-            return mu, Vh[:r].T
+            return Vh[:r].T
         try:
             _, _, Vh = torch.linalg.svd(Xc.cuda(), full_matrices=False)
-            return mu, Vh[:r].T.cpu().contiguous()
+            return Vh[:r].T.cpu().contiguous()
         except RuntimeError:  # OOM (incl. capped) or cusolver workspace
             torch.cuda.empty_cache()
             log("pca_fit: GPU SVD unavailable, falling back to CPU")
     _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
-    return mu, Vh[:r].T
+    return Vh[:r].T
+
+
+def pca_fit(X, r):
+    mu = X.mean(0, keepdim=True)
+    return mu, _svd_components(X - mu, r)
 
 
 def stack_flat(k_pre, v_pre):
@@ -327,11 +333,16 @@ def stack_unflat(X, L, kvh, hd):
 
 
 def fit_joint(k_pre, v_pre, fit_len, R, scale=None):
+    # memory-lean: one big matrix alive at a time (the 32k fp32 stack is
+    # ~9.4 GB per copy at 4B; the naive path holds three plus LAPACK's own)
     X = stack_flat(k_pre, v_pre)
     std = scale if scale is not None else \
         X[:fit_len].std(0, keepdim=True).clamp_min(1e-6)
-    mu, W = pca_fit(X[:fit_len] / std, R)
-    return {"std": std, "mu": mu, "W": W}
+    Xs = X[:fit_len] / std
+    del X
+    mu = Xs.mean(0, keepdim=True)
+    Xs -= mu
+    return {"std": std, "mu": mu, "W": _svd_components(Xs, R)}
 
 
 def apply_joint(codec, k_pre, v_pre, coeff_bits=16, keep_ranks=None):

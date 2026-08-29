@@ -149,11 +149,17 @@ def main():
 
     log(f"prefill ({T} tokens, chunk={args.prefill_chunk or 'one-shot'})...")
     hidden, keys_t, values_t, _ = prefill_doc(model, ids,
-                                              chunk=args.prefill_chunk)
+                                              chunk=args.prefill_chunk,
+                                              want_logits=False)
     log("pre-RoPE KV recompute...")
     k_pre, v_pre = pre_rope_kv(model, hidden)
     pos = torch.arange(T).unsqueeze(0)
     dev, dt = next(model.parameters()).device, model.dtype
+    from common import behavioral_weights, metric_scale
+    bscale = metric_scale(*behavioral_weights(model, hidden))
+    if args.metric != "nondiag":
+        del hidden  # (L+1,T,D) fp32, ~12 GB at 4B/32k; only the behavioral
+        hidden = None  # weights and nondiag grams ever read it
 
     methods = [("full KV", None, None)]
     for ratio in [int(r) for r in args.ratios.split(",")]:
@@ -171,7 +177,7 @@ def main():
             log(f"fit codec: {name}...")
             from common import fit_joint, stack_flat
             if metric == "behavioral":
-                codec = behavioral_codec(model, hidden, k_pre, v_pre, T, R)
+                codec = fit_joint(k_pre, v_pre, T, R, scale=bscale)
                 kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
             elif metric == "variance":
                 codec = fit_joint(k_pre, v_pre, T, R)
@@ -200,6 +206,9 @@ def main():
             per_type[nd["type"]][1] += 1
             nlls.append(nll)
         del keys, values
+        if R is None:
+            keys_t = values_t = None  # free the fp32 baseline stacks
+
         total = sum(v[0] for v in per_type.values())
         rows[name] = (per_type, total, len(needles), sum(nlls) / len(nlls))
         detail = "  ".join(f"{t}:{v[0]}/{v[1]}" for t, v in sorted(per_type.items()))
