@@ -486,14 +486,73 @@ recall intact, dNLL +0.004. Findings, stated narrowly:
    across stack sizes (T/rank here 1.7-6.9 vs 4.7-9.4 in the 0.5B
    rows); 32k extends the stress range and remains pending.
 
-> [PENDING from this gate: a second model family; 32k; the IFEval-style
-> compliance, leakage, and RULER batteries; matched-byte
-> quantization/SVD baselines; the §6.1 conditional-coding context test.
-> Net-vs-marginal accounting at 4B geometry: the fp16 per-document basis
-> is ~1.36 GB at 16x (rank 9216), ~680 MB at 32x, ~340 MB at 64x, so
-> net ratios approach marginal only at 100k+ contexts unless the basis
-> is generated rather than stored (the A4 learned-encoder direction) or
-> structurally compressed (A19 rules out naive int8).]
+### Second family: Mistral-7B-Instruct-v0.2, 2026-08-29
+
+A deliberately different substrate: different pretraining, sentencepiece
+tokenizer, 32-layer GQA geometry (65536-dim stack, 131072 B/tok fp16),
+and an instruct model evaluated on raw completion, so its own full-KV
+baselines are imperfect (39/42 across three 8k seeds). All codec rows
+are read relative to those baselines. Two harness portability bugs were
+caught at the baseline gate and fixed before any compressed row was
+produced: sentencepiece auto-BOS corrupting needle/gold tokenization,
+and WDDM paging (rather than failing) an oversized GPU SVD.
+
+8k, three seeds (aggregate; per-seed reports in reports/):
+
+| method | aggregate | note |
+|---|---|---|
+| full KV | 39/42 | baseline |
+| behavioral 32x | 34/42 | |
+| variance 32x | 33/42 | |
+| behavioral 64x | 35/42 | |
+| variance 64x | 27/42 | trending toward the 0.5B collapse |
+
+16k (seed 11): full KV 13/14 (0.332); behavioral 16x 13/14 (0.329),
+32x 11/14 (0.362), 64x 13/14 (0.238); variance 16x 12/14, 32x 11/14,
+64x 8/14 (0.595).
+
+Findings, stated narrowly:
+
+1. **Family transfer holds with a real, ratio-dependent tax.** Unlike
+   Qwen3-4B, Mistral pays ~5/42 needles at 32x-64x. A pre-registered
+   16k test resolved the mechanism: behavioral 16x reproduces the
+   baseline exactly (13/14, same per-type misses, dNLL -0.003), so the
+   tax is an operating-point matter, not an intrinsic fragility at all
+   ratios. Each family has a ratio where compression is behaviorally
+   free; Mistral's is more conservative than Qwen's.
+2. **Identifiers are the fragile content type on this family.** The
+   snake_case needles fail first for both metrics under stress,
+   consistent with a tokenization-multiplicative mechanism: exact
+   recall of a many-piece sentencepiece span requires every piece to
+   survive. Retained as the design case for a two-channel codec
+   (compressed semantic coordinates plus a small exactness residual
+   for structurally identifiable symbolic spans).
+3. **A complementary failure profile appeared twice at 32x and was
+   killed twice at 64x, both times by pre-registration.** Seed-13/8k
+   and seed-11/16k both show behavioral keeping confusables while
+   dropping identifiers and variance doing the exact mirror; the
+   pre-registered 64x follow-ups both failed to reproduce it (variance
+   loses its identifier advantage and degrades broadly). Adjacent-ratio
+   recall is also non-monotonic twice on this family. Per-row profiles
+   are noisy on Mistral; the quotable objects are aggregates and NLL
+   trends.
+4. **The metric verdict, revised.** Behavior-weighted compression
+   improves aggregate fidelity under stress on both families
+   (Mistral totals: behavioral 106/126 vs variance 91/126; floors
+   11/14 vs 8/14), but the optimal preservation metric is family- and
+   content-dependent, and single-row reversals occur. The 0.5B-style
+   variance recall collapse reappears partially on Mistral at 64x
+   (27/42), so the scale rescue observed at Qwen-4B is itself partly
+   family-dependent.
+
+> [PENDING from this gate: 32k; the IFEval-style compliance, leakage,
+> and RULER batteries; matched-byte quantization/SVD baselines; the
+> §6.1 conditional-coding context test. Net-vs-marginal accounting at
+> 4B geometry: the fp16 per-document basis is ~1.36 GB at 16x (rank
+> 9216), ~680 MB at 32x, ~340 MB at 64x, so net ratios approach
+> marginal only at 100k+ contexts unless the basis is generated rather
+> than stored (the A4 learned-encoder direction) or structurally
+> compressed (A19 rules out naive int8).]
 
 Beyond the gate: a learned, context-conditioned encoder/decoder trained by
 distillation against the frozen teacher (the token-level test of the
