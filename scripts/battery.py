@@ -123,10 +123,17 @@ def main():
     ap.add_argument("--prefill-chunk", type=int, default=0,
                     help="prefill in segments of N tokens (0 = one-shot); "
                          "identical output, bounded VRAM peak")
+    ap.add_argument("--vram-frac", type=float, default=1.0,
+                    help="hard per-process VRAM cap as a fraction of the "
+                         "card; allocations beyond it raise OOM on our side "
+                         "instead of evicting other apps (GPU sharing)")
     args = ap.parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
              "fp16": torch.float16, None: None}[args.dtype]
 
+    if args.vram_frac < 1.0 and torch.cuda.is_available():
+        torch.cuda.set_per_process_memory_fraction(args.vram_frac)
+        log(f"VRAM capped at {args.vram_frac:.0%} of the card")
     model = load_model(args.model, dtype=dtype)
     tok = AutoTokenizer.from_pretrained(args.model)
     L, kvh, hd, stack_dim, fp16_b = kv_geometry(model.config)

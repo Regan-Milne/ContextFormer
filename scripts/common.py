@@ -135,9 +135,11 @@ def prefill_doc(model, ids, chunk=0):
             output_hidden_states=True, use_cache=True,
         )
         cache = out.past_key_values
-        hid_parts.append(torch.stack([h.squeeze(0).float().cpu()
+        # offload first, upcast on CPU: bf16 -> fp32 is exact either way and
+        # this avoids a per-segment fp32 logits copy on the device
+        hid_parts.append(torch.stack([h.squeeze(0).cpu().float()
                                       for h in out.hidden_states]))
-        log_parts.append(out.logits.squeeze(0).float().cpu())
+        log_parts.append(out.logits.squeeze(0).cpu().float())
         del out
     kv = cache_kv(cache)
     keys = torch.stack([k.squeeze(0).float().cpu() for k, _ in kv])
@@ -296,8 +298,9 @@ def pca_fit(X, r):
         try:
             _, _, Vh = torch.linalg.svd(Xc.cuda(), full_matrices=False)
             return mu, Vh[:r].T.cpu().contiguous()
-        except torch.cuda.OutOfMemoryError:
+        except RuntimeError:  # OOM (incl. capped) or cusolver workspace
             torch.cuda.empty_cache()
+            log("pca_fit: GPU SVD unavailable, falling back to CPU")
     _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
     return mu, Vh[:r].T
 
