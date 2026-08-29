@@ -128,6 +128,11 @@ def main():
                     help="hard per-process VRAM cap as a fraction of the "
                          "card; allocations beyond it raise OOM on our side "
                          "instead of evicting other apps (GPU sharing)")
+    ap.add_argument("--fit-stride", type=int, default=1,
+                    help="fit the codec on every Nth position (evaluation "
+                         "always uses all positions). Required at 32k on "
+                         "LP64 LAPACK: T*stack_dim > 2^31 elements crashes "
+                         "gesdd. Disclosed in row names when > 1")
     args = ap.parse_args()
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16,
              "fp16": torch.float16, None: None}[args.dtype]
@@ -161,12 +166,20 @@ def main():
         del hidden  # (L+1,T,D) fp32, ~12 GB at 4B/32k; only the behavioral
         hidden = None  # weights and nondiag grams ever read it
 
+    s = args.fit_stride
+    if s > 1 and args.metric == "nondiag":
+        raise SystemExit("--fit-stride not implemented for the nondiag metric")
+    kf = k_pre[:, :, ::s] if s > 1 else k_pre
+    vf = v_pre[:, :, ::s] if s > 1 else v_pre
+    Tf = kf.shape[2]
+    tag = f", fit-stride {s}" if s > 1 else ""
+
     methods = [("full KV", None, None)]
     for ratio in [int(r) for r in args.ratios.split(",")]:
-        R = min(fp16_b // ratio, T - 8, stack_dim - 8)   # int8 coeffs: R bytes/tok
-        methods.append((f"{args.metric} {ratio}x (rank {R} c8)", R, args.metric))
+        R = min(fp16_b // ratio, Tf - 8, stack_dim - 8)  # int8 coeffs: R bytes/tok
+        methods.append((f"{args.metric} {ratio}x (rank {R} c8{tag})", R, args.metric))
         if args.variance_control and args.metric != "variance":
-            methods.append((f"variance {ratio}x (rank {R} c8)", R, "variance"))
+            methods.append((f"variance {ratio}x (rank {R} c8{tag})", R, "variance"))
 
     grams = None
     rows = {}
@@ -177,14 +190,14 @@ def main():
             log(f"fit codec: {name}...")
             from common import fit_joint, stack_flat
             if metric == "behavioral":
-                codec = fit_joint(k_pre, v_pre, T, R, scale=bscale)
+                codec = fit_joint(kf, vf, Tf, R, scale=bscale)
                 kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
             elif metric == "variance":
-                codec = fit_joint(k_pre, v_pre, T, R)
+                codec = fit_joint(kf, vf, Tf, R)
                 kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
             elif metric == "raw":
-                ones = torch.ones(1, stack_flat(k_pre, v_pre).shape[1])
-                codec = fit_joint(k_pre, v_pre, T, R, scale=ones)
+                ones = torch.ones(1, stack_dim)
+                codec = fit_joint(kf, vf, Tf, R, scale=ones)
                 kh, vh = apply_joint(codec, k_pre, v_pre, coeff_bits=8)
             else:  # nondiag
                 from c1_basis_science import block_grams, nondiag_codec
