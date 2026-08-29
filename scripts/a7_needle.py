@@ -48,8 +48,10 @@ def probe_needle(model, tok, keys, values, past_len, name, gold_num,
     cast by build_cache."""
     dev = next(model.parameters()).device
     query = (query_template or QUERY).format(name)
-    q_ids = tok(query, return_tensors="pt").input_ids.to(dev)
-    gold_ids = tok(" " + gold_num, return_tensors="pt").input_ids.squeeze(0).to(dev)
+    q_ids = tok(query, return_tensors="pt",
+                add_special_tokens=False).input_ids.to(dev)
+    gold_ids = tok(" " + gold_num, return_tensors="pt",
+                   add_special_tokens=False).input_ids.squeeze(0).to(dev)
 
     # teacher-forced NLL of the gold continuation
     cache = build_cache(keys, values, past_len, model)

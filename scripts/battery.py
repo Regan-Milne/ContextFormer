@@ -92,7 +92,8 @@ def gen_needles(rng, per_type):
 def build_doc(tok, filler_text, needles, target_tokens):
     filler = tok(filler_text, return_tensors="pt").input_ids.squeeze(0)
     n = len(needles)
-    needle_ids = [tok(nd["insert"], return_tensors="pt").input_ids.squeeze(0)
+    needle_ids = [tok(nd["insert"], return_tensors="pt",
+                      add_special_tokens=False).input_ids.squeeze(0)
                   for nd in needles]
     chunk = max(40, (target_tokens - sum(x.shape[0] for x in needle_ids)) // (n + 1))
     pieces, depths, off = [], [], 0
