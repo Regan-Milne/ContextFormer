@@ -545,7 +545,44 @@ Findings, stated narrowly:
    (27/42), so the scale rescue observed at Qwen-4B is itself partly
    family-dependent.
 
-> [PENDING from this gate: 32k; the IFEval-style compliance, leakage,
+### 32k, Qwen3-4B: the variance collapse returns (partial battery, 2026-08-30)
+
+Fits at 32k use every 2nd position (fit-stride 2, ledger A26: the full
+fit matrix exceeds LP64 LAPACK addressing); evaluation uses all 31993
+positions, and both metrics share the identical fit protocol, so the
+comparison is internally fair. NLL values here carry the A26 fit-stride
+confound vs full-fit rows at shorter lengths; recall values do not. The
+full-KV baseline reproduced identically across six independent
+prefill+probe cycles (14/14, gold-NLL 0.018).
+
+| method | recall | gold-NLL |
+|---|---|---|
+| full KV | 14/14 | 0.018 |
+| behavioral 16x (rank 9216) | 14/14 | 0.011 |
+| variance 16x | 9/14 | 0.319 |
+| behavioral 32x (rank 4608) | 14/14 | 0.006 |
+| variance 32x | 5/14 | 1.048 |
+| behavioral 64x (rank 2304) | [in flight] | |
+| variance 64x | [in flight] | |
+
+Two findings, the first correcting this section's earlier reading:
+
+1. **The variance collapse is context-length-dependent, not
+   model-scale-dependent.** Earlier tranches read variance's survival
+   at 4B/8k-16k as scale robustness. At 32k it collapses (9/14, then
+   5/14) while behavioral holds 14/14 with sub-baseline NLL. The
+   discriminating variable is evaluation length itself: the failing
+   variance 16x row matches its passing 16k sibling on fit-sample
+   count and T/rank. The short-context rescue was real but does not
+   extend; the 0.5B collapse was the long-context truth arriving
+   early.
+2. **Fixed rank stretches 4x for the behavioral metric.** Rank 4608 is
+   perfect at 8k, 16k, and 32k (T/rank 1.7 to 6.9); rank 9216 at 16k
+   and 32k. Sublinear rank demand (A21) holds over the full measured
+   range, for the behavioral metric only.
+
+> [PENDING from this gate: the 32k 64x rows (in flight); the
+> IFEval-style compliance, leakage,
 > and RULER batteries; matched-byte quantization/SVD baselines; the
 > §6.1 conditional-coding context test. Net-vs-marginal accounting at
 > 4B geometry: the fp16 per-document basis is ~1.36 GB at 16x (rank
