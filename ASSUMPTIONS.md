@@ -62,16 +62,32 @@ Dynamic Rank studies how the minimum representational rank required to
 preserve behavior changes over the lifetime of a context, and whether that
 rank can be adjusted online as representational demand changes.
 
-- **DR1 (research, running):** does required rank vary with context
-  composition at fixed T? (A27; prose-vs-repetitive pilot, then the
-  five-class sweep.)
-- **DR2 (research, queued):** can rank-demand changes be DETECTED without
-  ground truth? Observational form first: session-shaped document (prose ->
-  technical -> code -> prose), fixed rank, test whether candidate signals
-  (per-token reconstruction residual in the retained band; behavioral-
-  weighted mass outside the subspace) align in time with recall failures.
-- **DR3 (R&D, fenced):** the online controller r_t = f(context state).
-  Out of scope until DR1/DR2 exist.
+- **DR1: does rank demand vary by context composition at fixed T?**
+  SUPPORTED (A27 pilot): intact-rank threshold shifts 2x (prose ~2304 vs
+  repetitive ~1152), and the 128x row is a large effect (12/14 @ NLL
+  0.215 vs 14/14 @ 0.020). Narrow claim earned: raw token count alone is
+  not sufficient to predict required behavioral rank.
+- **DR2: what variables determine rank demand?** Working capacity model to
+  fit: r_min ~ r0 + alpha*N_needles + beta*C_context, where r0 =
+  intrinsic/task/model floor, N = explicitly retrievable novel facts, C =
+  complexity/novelty of surrounding context. The pilot floor is
+  PROVISIONAL, not established as intrinsic: the repetitive condition
+  still carries needles, position/ordering structure, query-retrieval
+  relations, same-token-different-location state, and possibly
+  irreducible model geometry. Instrument: five-class sweep x needle-count
+  factorial.
+- **DR3: does rank demand change locally over one session's lifetime?**
+  Session-shaped document (prose -> technical -> code -> prose), fixed
+  rank, per-region recall.
+- **DR4: can that change be predicted cheaply enough to adjust rank
+  online?** Candidate signals: per-token reconstruction residual in the
+  retained band, behavioral-weighted mass outside the subspace, novelty
+  of incoming states. Correlational validity first.
+- The controller itself remains R&D, beyond DR4.
+
+Reframing (2026-08-30): the track's question is no longer "how low can
+rank go?" but "what determines the amount of representational capacity a
+context actually deserves?"
 
 Structural note: for a FIXED basis, nested PCA truncation is progressive
 encoding (rank-r codes are prefixes of rank-r' codes; apply_joint
