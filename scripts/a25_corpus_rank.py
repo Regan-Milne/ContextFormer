@@ -62,6 +62,10 @@ def main():
                     help="comma list; default = stack ranks for 2x/4x/8x/16x")
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--report-dir", default="reports")
+    ap.add_argument("--load-basis", default=None,
+                    help="path to a saved shared-basis .pt; skips phase A")
+    ap.add_argument("--eval-only", default=None,
+                    help="comma list of eval doc name prefixes to run")
     args = ap.parse_args()
 
     model = load_model(args.model)
@@ -73,32 +77,45 @@ def main():
     print(f"{args.model}: stack {stack_dim}, ranks {ranks}", flush=True)
 
     # ---- phase A: shared corpus basis (plain docs, no needles) ----
-    pools, wKs, wVs = [], [], []
-    for name, path, skip in TRAIN:
-        log(f"train doc: {name}")
-        text = open(path, encoding="utf-8", errors="ignore").read()[skip:]
-        hidden, k_pre, v_pre = doc_stacks(model, tok, text, args.train_tokens)
-        wK, wV = behavioral_weights(model, hidden)
-        wKs.append(wK); wVs.append(wV)
-        pools.append(stack_flat(k_pre[:, :, ::args.train_stride],
-                                v_pre[:, :, ::args.train_stride]))
-        del hidden, k_pre, v_pre
-    scale = metric_scale(torch.stack(wKs).mean(0), torch.stack(wVs).mean(0))
-    X = torch.cat(pools, dim=0); del pools
-    log(f"corpus fit: {X.shape[0]} pooled positions, rank {min(rmax, X.shape[0] - 8)}")
-    Xs = X / scale; del X
-    mu = Xs.mean(0, keepdim=True)
-    Xs -= mu
-    W = _svd_components(Xs, min(rmax, Xs.shape[0] - 8)); del Xs
-    torch.save({"std": scale, "mu": mu, "W": W}, "reports/a25_corpus_basis.pt")
-    log(f"shared basis: rank {W.shape[1]} saved")
+    slug = args.model.split("/")[-1].replace(".", "")
+    if args.load_basis:
+        saved = torch.load(args.load_basis)
+        scale, mu, W = saved["std"], saved["mu"], saved["W"]
+        log(f"loaded shared basis rank {W.shape[1]} from {args.load_basis}")
+    else:
+        pools, wKs, wVs = [], [], []
+        for name, path, skip in TRAIN:
+            log(f"train doc: {name}")
+            text = open(path, encoding="utf-8", errors="ignore").read()[skip:]
+            hidden, k_pre, v_pre = doc_stacks(model, tok, text,
+                                              args.train_tokens)
+            wK, wV = behavioral_weights(model, hidden)
+            wKs.append(wK); wVs.append(wV)
+            pools.append(stack_flat(k_pre[:, :, ::args.train_stride],
+                                    v_pre[:, :, ::args.train_stride]))
+            del hidden, k_pre, v_pre
+        scale = metric_scale(torch.stack(wKs).mean(0),
+                             torch.stack(wVs).mean(0))
+        X = torch.cat(pools, dim=0); del pools
+        log(f"corpus fit: {X.shape[0]} pooled positions, "
+            f"rank {min(rmax, X.shape[0] - 8)}")
+        Xs = X / scale; del X
+        mu = Xs.mean(0, keepdim=True)
+        Xs -= mu
+        W = _svd_components(Xs, min(rmax, Xs.shape[0] - 8)); del Xs
+        torch.save({"std": scale, "mu": mu, "W": W},
+                   f"reports/a25_corpus_basis_{slug}.pt")
+        log(f"shared basis: rank {W.shape[1]} saved")
 
     # ---- phase B: held-out evaluation ----
     rng = random.Random(args.seed)
     needles = gen_needles(rng, 3)
     types = sorted(set(nd["type"] for nd in needles))
     rows = []
+    only = args.eval_only.split(",") if args.eval_only else None
     for name, path, skip in EVAL:
+        if only and not any(name.startswith(p) for p in only):
+            continue
         log(f"eval doc: {name}")
         text = open(path, encoding="utf-8", errors="ignore").read()[skip:]
         ids, depths = build_doc(tok, text, needles, args.target_tokens)
